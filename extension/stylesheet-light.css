@@ -53,3 +53,14 @@
 #panel .dictation-mic-busy { color: -st-accent-color; }
 #panel .dictation-mic-done { color: #8ff0a4; }
 #panel .dictation-mic-error { color: #ffa348; }
+
+/* Blur my Shell (popup blur on): it puts one of these classes on the UI group and gives the pill the translucent
+   background of its menus; the drop shadow would show through it as a grey smear, so the glass has none */
+.bms-popup-background-transparent .dictation-pill,
+.bms-popup-background-light .dictation-pill,
+.bms-popup-background-dark .dictation-pill,
+.bms-popup-surface-transparent .dictation-pill,
+.bms-popup-surface-light .dictation-pill,
+.bms-popup-surface-dark .dictation-pill {
+  box-shadow: none;
+}

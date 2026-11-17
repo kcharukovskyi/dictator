@@ -972,7 +972,10 @@ export class Core {
     // stylesheet.css (dark) and stylesheet-light.css: GNOME Shell picks the one for its light/dark style.
     _buildUi() {
         const y_align = Clutter.ActorAlign.CENTER;
-        this._pill = new St.BoxLayout({style_class: 'dictation-pill', reactive: false, visible: false, y_align});
+        // bms-popup-blur-target: opt in to Blur my Shell's popup blur (menus, OSDs), so with that extension the pill
+        // is glass like the rest of the Shell; it keeps the pill's own capsule radius. Without it the class does nothing.
+        this._pill = new St.BoxLayout({style_class: 'dictation-pill bms-popup-blur-target', reactive: false,
+            visible: false, y_align});
         this._badgeIcon = new St.Icon({style_class: 'dictation-badge-icon', icon_name: 'audio-input-microphone-symbolic',
             x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER});
         this._badge = new St.Bin({style_class: 'dictation-badge', child: this._badgeIcon, y_align});
