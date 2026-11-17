@@ -1,0 +1,55 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* SPDX-FileCopyrightText: 2025-2026 The Dictator authors (see AUTHORS) */
+/* Dictation pill, light style (the dark one: stylesheet.css; GNOME Shell loads only one of them,
+   so this file is complete on its own). Adwaita light colours. */
+.dictation-pill {
+  background-color: #ffffff;
+  color: rgba(0, 0, 6, 0.8);
+  border: 1px solid rgba(0, 0, 6, 0.08);
+  border-radius: 999px;
+  padding: 8px 18px 8px 8px;
+  spacing: 12px;
+  box-shadow: 0 3px 12px 1px rgba(0, 0, 6, 0.15);
+}
+
+.dictation-badge {
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  background-color: rgba(0, 0, 6, 0.08);
+}
+.dictation-badge-icon { icon-size: 16px; color: #ffffff; }
+.dictation-badge.dictation-rec { background-color: #e01b24; }
+.dictation-badge.dictation-pause { background-color: #e5a50a; }
+.dictation-badge.dictation-pause .dictation-badge-icon { color: rgba(0, 0, 6, 0.8); }
+.dictation-badge.dictation-done { background-color: #26a269; }
+.dictation-badge.dictation-error { background-color: #c64600; }
+
+.dictation-spinner { width: 32px; height: 32px; color: -st-accent-color; }
+
+.dictation-wave {
+  width: 168px;
+  height: 30px;
+  color: rgba(0, 0, 6, 0.8);
+  -dictation-loud-color: #e66100;
+}
+
+.dictation-time {
+  font-weight: bold;
+  font-feature-settings: "tnum";
+  min-width: 38px;
+}
+
+.dictation-status { padding-right: 4px; }
+
+/* Top-bar menu: the last texts, one line each, with the time dimmed on the right */
+.dictation-menu-text { max-width: 22em; }
+.dictation-menu-dim { color: rgba(0, 0, 6, 0.5); }
+.dictation-menu-time { font-feature-settings: "tnum"; padding-left: 12px; }
+
+/* Top-bar icon: the colour of the pill's state (the top bar is dark in both styles) */
+#panel .dictation-mic-rec { color: #ff7b63; }
+#panel .dictation-mic-pause { color: #f8e45c; }
+#panel .dictation-mic-busy { color: -st-accent-color; }
+#panel .dictation-mic-done { color: #8ff0a4; }
+#panel .dictation-mic-error { color: #ffa348; }

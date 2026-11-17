@@ -1,0 +1,9 @@
+{
+  "uuid": "dictator@kcharukovskyi.github.io",
+  "name": "Dictator",
+  "description": "Offline voice dictation. Press Ctrl+Alt+Space, speak, press Enter: the text is typed where your cursor was. Speech recognition runs on your computer with a sandboxed, network-less model (NVIDIA Parakeet TDT 0.6B v3, CC BY 4.0); audio never leaves the machine and the clipboard is not used. 25 European languages (turn on the ones you speak; mixing them works). Needs the Dictator helper and model, installed separately (see the project page). Not affiliated with NVIDIA.",
+  "version-name": "1.0.0",
+  "url": "https://github.com/kcharukovskyi/dictator",
+  "session-modes": ["user", "unlock-dialog"],
+  "shell-version": ["51"]
+}
