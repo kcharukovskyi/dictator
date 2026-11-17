@@ -127,7 +127,9 @@ GNOME already owns (for example, Super+Space switches the input source).
 
 ## License
 
-Dictator is licensed GPL-3.0-or-later (see [LICENSE](LICENSE) and [AUTHORS](AUTHORS)). The speech
+Dictator is made by [kcharukovskyi](https://github.com/kcharukovskyi) and [Yegor Isakov](https://isakov.fyi)
+([@yegqr](https://github.com/yegqr)). It is licensed GPL-3.0-or-later (see [LICENSE](LICENSE) and
+[AUTHORS](AUTHORS)). The speech
 model is NVIDIA's and licensed CC BY 4.0. Dictator writes its attribution to `NOTICE.txt` in the model
 folder.
 

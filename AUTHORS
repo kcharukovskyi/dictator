@@ -5,6 +5,7 @@ Copyright in Dictator's code belongs to its authors. It is licensed to everyone 
 GPL-3.0-or-later (see LICENSE).
 
 - kcharukovskyi (https://github.com/kcharukovskyi)
+- Yegor Isakov (https://github.com/yegqr, https://isakov.fyi)
 
 The speech model is not part of Dictator: it is NVIDIA's work (CC BY 4.0). Dictator writes its
 attribution into NOTICE.txt next to the downloaded model files.
