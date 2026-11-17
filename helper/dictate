@@ -1,0 +1,1265 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2025-2026 The Dictator authors (see AUTHORS)
+"""Dictator helper: records the microphone and turns speech into text on this computer.
+
+Started by the Dictator GNOME extension for each recording. It records with pw-record until it gets
+"stop" or "cancel" on stdin ("pause" / "resume": the paused stretch is cut out), then runs the speech
+model (NVIDIA Parakeet TDT 0.6B v3, parakeet.py) in a sandbox without network and prints the text.
+Protocol on stdout, one line each:
+    L <0..1>      voice level, ~20 per second while recording
+    S             recording finished, transcribing
+    T <json str>  the text
+    E <message>   error (English, shown on screen)
+
+The recording is kept in $XDG_RUNTIME_DIR/dictate (RAM) until its text is out; a failed one stays there
+and `dictate --retry` transcribes it again. With the history on (privacy settings) the last 3
+recordings stay in $XDG_RUNTIME_DIR/dictate-history for the extension's menu. Kept recordings are
+deleted after keep_minutes. Nothing is written to the disk but settings, the model and a log of numbers
+(~/.cache/dictate/dictate.log, never any text). This program never touches the clipboard.
+
+Other commands:
+    dictate --models               installed model variants, as JSON (for the settings window)
+    dictate --download int8|fp32   download a model variant from Hugging Face (pinned revision, every
+                                   file checked against its SHA-256); the only network access
+    dictate --remove int8|fp32     delete a model variant
+    dictate --selftest             load the model once and check that its sandbox has no network
+
+Where the model runs: ~/.config/dictate/runtime holds "host" (system Python with onnxruntime + numpy,
+in bubblewrap) or "podman" / "docker" (the offline "dictate-asr" image built from Containerfile).
+Without that file: host if those Python packages are installed, else podman, else docker.
+"""
+import array
+import io
+import json
+import math
+import os
+import re
+import selectors
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import wave
+
+RATE = 16000
+CHUNK = RATE // 20 * 2                 # 50 ms of s16 mono
+MAX_SECONDS = 15 * 60                  # of speech (pauses not counted)
+MAX_WALL_SECONDS = 60 * 60             # with pauses
+MIN_SECONDS = 0.4
+# the speech model's 25 languages (lib/parakeet.py); which are on: ~/.config/dictate/speech
+LANGS = ["en", "de", "fr", "es", "it", "pt", "nl", "da", "sv", "fi", "pl", "cs", "sk", "sl", "hr", "hu",
+         "ro", "lv", "lt", "et", "mt", "uk", "ru", "bg", "el"]
+ASR_SCRIPT = os.path.expanduser("~/.local/lib/dictate/parakeet.py")
+MODEL_DIR = os.path.expanduser("~/.local/share/dictate/parakeet-tdt-0.6b-v3")
+ASR_IMAGE = "dictate-asr"
+# The model: NVIDIA's Parakeet TDT 0.6B v3 in the ONNX format of the onnx-asr project, at a fixed revision.
+# Every file is checked against its SHA-256 (for the big ones, the hash Hugging Face shows for the file).
+MODEL_URL = ("https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/"
+             "8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/")
+MODEL_FILES = {                        # name: (bytes, sha256)
+    "nemo128.onnx": (139764, "a9fde1486ebfcc08f328d75ad4610c67835fea58c73ba57e3209a6f6cf019e9f"),
+    "vocab.txt": (93939, "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d"),
+    "encoder-model.onnx": (41770866, "98a74b21b4cc0017c1e7030319a4a96f4a9506e50f0708f3a516d02a77c96bb1"),
+    "encoder-model.onnx.data": (2435420160, "9a22d372c51455c34f13405da2520baefb7125bd16981397561423ed32d24f36"),
+    "decoder_joint-model.onnx": (72520893, "e978ddf6688527182c10fde2eb4b83068421648985ef23f7a86be732be8706c1"),
+}
+COMMON_FILES = ["nemo128.onnx", "vocab.txt"]
+FP32_FILES = ["encoder-model.onnx", "encoder-model.onnx.data", "decoder_joint-model.onnx"]
+INT8_FILES = ["encoder-model.int8.onnx", "decoder_joint-model.int8.onnx"]
+# int8 is made on this computer from the fp32 files (parakeet.py --quantize). With onnxruntime 1.22 the
+# result is byte for byte this; another version may differ slightly, which is fine.
+INT8_REFERENCE = {
+    "encoder-model.int8.onnx": "f5230a6587582aa5d0ea05b7b27185efdf911dc0bcb8a9b1928891c8045fed15",
+    "decoder_joint-model.int8.onnx": "6cc5e3ef27047ff2344cfbf11d60fd4f11e0191e647010115c620ce58c99617f",
+}
+VARIANTS = {"int8": INT8_FILES, "fp32": FP32_FILES}
+INT8_SIZE = 935138005                  # bytes the int8 files take
+QUANTIZE_MEMORY_GB = 6                 # free memory needed while converting to int8
+RUNTIME_FILE = os.path.expanduser("~/.config/dictate/runtime")
+LOAD_TIMEOUT_S = 90
+LOG_FILE = os.path.expanduser("~/.cache/dictate/dictate.log")
+PENDING_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "dictate")
+HISTORY_DIR = PENDING_DIR + "-history"
+HISTORY_N = 3
+# ~/.config/dictate/privacy (written by the settings window, format: extension/keys.js):
+#   history = on|off       keep the last HISTORY_N recordings for the top-bar menu
+#   keep_minutes = N       delete kept recordings (history and failed ones) after N minutes; 0 = until restart
+PRIVACY_FILE = os.path.expanduser("~/.config/dictate/privacy")
+MAX_TEXT = 50000                       # 15 min of speech is ~20 000 characters
+
+
+def privacy():
+    p = {"history": True, "keep_minutes": 60}
+    try:
+        with open(PRIVACY_FILE) as f:
+            for line in f:
+                m = re.fullmatch(r"\s*(history|keep_minutes)\s*=\s*(\S+)\s*", line)
+                if m and m[1] == "history":
+                    p["history"] = m[2] != "off"
+                elif m and m[2].isdigit():
+                    p["keep_minutes"] = int(m[2])
+    except OSError:
+        pass
+    return p
+
+
+# ~/.config/dictate/speech (written by the settings window, format: extension/keys.js):
+#   languages = uk en ru    the enabled languages, main first
+#   margin = 0.15           how much surer another Cyrillic language must be than the main one
+#   threads = 0             CPU threads for the model; 0 = automatic
+#   final_period = keep|drop|chats   no "." at the end: never / always / in chats and terminals (the
+#                           extension knows the app, it does "chats")
+#   spoken_punctuation = off|on   say "кома", "знак питання", "новий рядок"... (uk, ru, en)
+#   fillers = on|off        remove hesitation sounds: "еее", "ммм", "um", "uh"
+#   space_after = on|off    (used by the extension: a space after the typed text)
+#   microphone = default    or a PipeWire source name (pactl list short sources)
+#   auto_stop = 0           finish by itself after this many seconds of silence (0 = never)
+#   voice_gate = off|light|medium|strong   mute sound much quieter than your voice (other people)
+#   pill = bottom|top       (used by the extension)
+#   model = int8|fp32       which model variant to use (if it is installed; else the other one)
+# ~/.config/dictate/replacements: "words = replacement" per line, applied to every text
+SPEECH_FILE = os.path.expanduser("~/.config/dictate/speech")
+# voice_gate: sound this many dB below your own voice is muted before recognition
+GATE_DB = {"off": 0, "light": 25, "medium": 18, "strong": 12}
+REPLACE_FILE = os.path.expanduser("~/.config/dictate/replacements")
+
+
+def speech():
+    p = {"languages": ["uk", "en", "ru"], "margin": 0.15, "threads": 0, "final_period": "keep",
+         "microphone": "default", "auto_stop": 0, "voice_gate": "off", "spoken_punctuation": False,
+         "fillers": True, "model": "int8"}
+    try:
+        with open(SPEECH_FILE) as f:
+            for line in f:
+                m = re.fullmatch(r"\s*(languages|margin|threads|final_period|microphone|auto_stop|voice_gate"
+                                 r"|spoken_punctuation|fillers|model)"
+                                 r"\s*=\s*(.*?)\s*", line)
+                if not m:
+                    continue
+                k, v = m[1], m[2]
+                try:
+                    if k == "languages":
+                        langs = [c for c in dict.fromkeys(v.replace(",", " ").split()) if c in LANGS]
+                        p[k] = langs or p[k]
+                    elif k == "margin":
+                        p[k] = min(2.0, max(0.0, float(v)))
+                    elif k == "threads":
+                        p[k] = min(64, max(0, int(v)))
+                    elif k == "auto_stop":
+                        p[k] = min(60, max(0, int(v)))
+                    elif k == "microphone":
+                        p[k] = v if re.fullmatch(r"[\w.:@+-]+", v) else "default"
+                    elif k == "voice_gate":
+                        p[k] = v if v in GATE_DB else "off"
+                    elif k in ("spoken_punctuation", "fillers"):
+                        p[k] = v == "on"
+                    elif k == "model":
+                        p[k] = v if v in VARIANTS else "int8"
+                    elif v in ("keep", "drop", "chats"):
+                        p[k] = v
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return p
+
+
+def replacements():
+    """[(compiled pattern, replacement)] from ~/.config/dictate/replacements; whole words, any case"""
+    out_ = []
+    try:
+        with open(REPLACE_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                a, b = (x.strip() for x in line.split("=", 1))
+                if a:
+                    out_.append((re.compile(r"(?<!\w)" + re.escape(a) + r"(?!\w)", re.I), b))
+    except OSError:
+        pass
+    return out_
+
+
+# A line break the user asked for ("новий рядок"): a private-use character, not "\n", so that every
+# cleaning step keeps it; the extension turns it into a line break, or into a space in a terminal (a
+# line break there would run a command).
+NEWLINE_MARK = "\ue000"
+# spoken punctuation, per language: phrase -> what it becomes (longer phrases first)
+SPOKEN = {
+    "uk": [("крапка з комою", ";"), ("знак питання", "?"), ("знак оклику", "!"), ("двокрапка", ":"),
+           ("новий абзац", "\n\n"), ("новий рядок", "\n"), ("кома", ","), ("крапка", "."), ("тире", "—")],
+    "ru": [("точка с запятой", ";"), ("вопросительный знак", "?"), ("знак вопроса", "?"),
+           ("восклицательный знак", "!"), ("двоеточие", ":"), ("новый абзац", "\n\n"),
+           ("новая строка", "\n"), ("запятая", ","), ("точка", "."), ("тире", "—")],
+    "en": [("question mark", "?"), ("exclamation mark", "!"), ("exclamation point", "!"),
+           ("semicolon", ";"), ("colon", ":"), ("new paragraph", "\n\n"), ("new line", "\n"),
+           ("comma", ","), ("full stop", "."), ("period", "."), ("dash", "—")],
+}
+# hesitation sounds only (not words like "ну" / "well", which can carry meaning)
+FILLERS = re.compile(r"(?<!\w)(?:е{2,}м*|э{2,}м*|а{2,}|м{2,}|ем{1,}|эм{1,}|хм+|u+h+m*|u+m+|e+r+m+|h+m+|m{2,})(?!\w)"
+                     r"[,.]?", re.I)
+PUNCT = "[\\s,.;:!?]*"
+# where a command word is an ordinary word: "точка зрения", "the period of"
+NOT_COMMAND = {"точка": r"(?!\s+(?:зрения|отсч[её]та|опоры|доступа|росы|кипения|замерзания|соприкосновения))",
+               "крапка": r"(?!\s+(?:зору|відліку|опори|доступу))", "period": r"(?!\s+of\b)",
+               "colon": r"(?!\s+(?:cancer|health)\b)", "dash": r"(?!\s+(?:cam|board)\b)"}
+
+
+def spoken_punctuation(text, langs):
+    for lang in langs:
+        for phrase, sym in SPOKEN.get(lang, []):
+            words = r"\s+".join(map(re.escape, phrase.split()))
+            # a line break keeps the punctuation before it ("справи? новий рядок"), the rest replace it
+            lead = r"[\s,]*" if sym.startswith("\n") else PUNCT
+            pat = re.compile(lead + r"(?<!\w)" + words + r"(?!\w)" + NOT_COMMAND.get(phrase, "") + PUNCT, re.I)
+            if sym.startswith("\n"):
+                rep_ = NEWLINE_MARK * len(sym)
+            elif sym == "—":
+                rep_ = " — "
+            else:
+                rep_ = sym + " "
+            text = pat.sub(lambda m: rep_, text)
+    # a capital letter after the end of a sentence or a line break
+    text = re.sub(r"([.?!]\s+|" + NEWLINE_MARK + r")(\w)", lambda m: m[1] + m[2].upper(), text)
+    return text.strip(" ")
+
+
+def polish(text, settings=None):
+    """The user's text settings: hesitation sounds out, spoken punctuation, word replacements and
+    snippets, no final period"""
+    settings = settings or speech()
+    text = text.replace(NEWLINE_MARK, " ")        # only a spoken command may make a line break
+    if settings["fillers"]:
+        at_start = bool(FILLERS.match(text.lstrip()))
+        text = FILLERS.sub("", text)
+        text = re.sub(r"\s+([,.;:!?])", r"\1", " ".join(text.split()))
+        text = re.sub(r"^[,.;:]\s*", "", text)
+        if at_start:                       # "Еее, привіт" -> "Привіт"
+            text = text[:1].upper() + text[1:]
+    if settings["spoken_punctuation"]:
+        text = spoken_punctuation(text, settings["languages"])
+    for pat, rep_ in replacements():
+        text = pat.sub(lambda m: rep_, text)
+    if settings["final_period"] == "drop" and text.endswith(".") and not text.endswith(".."):
+        text = text[:-1]
+    # spaces around a line break are not wanted
+    text = re.sub(r" *(" + NEWLINE_MARK + r"+) *", r"\1", text)
+    return clean(text)
+
+
+# Speech gives one line of words. Control characters (line breaks, ESC sequences), zero-width and
+# bidi-override characters cannot come from it: they are cut, so that even a tampered model cannot
+# make the paste run a command in a terminal or hide text (the extension cleans the text again).
+_BAD_CHARS = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]")
+
+
+def clean(text):
+    if not isinstance(text, str):
+        return ""
+    return " ".join(_BAD_CHARS.sub(" ", text).split())[:MAX_TEXT]
+
+
+def out(line):
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+def log(msg):
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    with open(LOG_FILE, "a") as f:
+        f.write(time.strftime("%F %T ") + msg + "\n")
+
+
+class Fail(Exception):
+    pass
+
+
+# ------------------------------------------------------------------ recording
+LIVE_NONZERO = 0.25             # a chunk with at least this share of non-zero samples = the mic really works
+
+
+def pw_record(extra):
+    proc = subprocess.Popen(["pw-record", "--raw", "--rate", str(RATE), "--channels", "1", "--format", "s16"]
+                            + extra + ["-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    os.set_blocking(proc.stdout.fileno(), False)
+    return proc
+
+
+def builtin_mic():
+    """The first wired/built-in microphone (not Bluetooth, not a monitor of an output)."""
+    try:
+        lines = subprocess.run(["pactl", "list", "short", "sources"], capture_output=True, text=True,
+                               timeout=2).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) > 1 and not parts[1].endswith(".monitor") and not parts[1].startswith("bluez_"):
+            return parts[1]
+    return None
+
+
+def sources():
+    """names of the real microphones (not monitors of outputs)"""
+    try:
+        lines = subprocess.run(["pactl", "list", "short", "sources"], capture_output=True, text=True,
+                               timeout=2).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [p[1] for p in (line.split("\t") for line in lines) if len(p) > 1 and not p[1].endswith(".monitor")]
+
+
+def default_source():
+    try:
+        return subprocess.run(["pactl", "get-default-source"], capture_output=True, text=True,
+                              timeout=2).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def is_live(chunk):
+    a = array.array("h")
+    a.frombytes(chunk)
+    return sum(1 for x in a if x) >= LIVE_NONZERO * max(len(a), 1)
+
+
+def stop_proc(proc):
+    if proc is None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def cut(raw, spans):
+    """raw without the paused [start, end) byte spans (end None = paused until the stop)."""
+    keep, pos = bytearray(), 0
+    for a, b in spans:
+        a = min(a, len(raw)) & ~1
+        b = len(raw) if b is None else min(b, len(raw)) & ~1
+        if a > pos:
+            keep += raw[pos:a]
+        pos = max(pos, b)
+    keep += raw[pos:]
+    return bytes(keep)
+
+
+def record():
+    """Returns raw s16 mono audio, or None when cancelled.
+    Pause: the microphones keep running (no headset re-switch, no gap in time), the paused stretches
+    are remembered as byte positions and cut out at the end.
+    Bluetooth headset: recording makes WirePlumber switch it from music mode (A2DP) to headset mode
+    (HFP), which takes ~1 s or more, and until then its mic gives only zeros: the first words were
+    lost. So the built-in mic records too, and the recording starts with the built-in mic until the
+    headset mic gives real sound (if it never does, the built-in mic is used for all of it).
+    Microphone: the one chosen in Settings (if it is still there), else the system default.
+    Auto-stop (Settings): after you spoke, this many seconds of silence finish the recording."""
+    sp = speech()
+    mic = sp["microphone"]
+    if mic != "default" and mic not in sources():
+        log("chosen microphone not found, using the default one")
+        mic = "default"
+    target = ["--target", mic] if mic != "default" else []
+    proc = pw_record(target + ["--media-role", "Communication", "-P", "{ node.name = dictate }"])
+    bridge = None
+    if (mic if mic != "default" else default_source()).startswith("bluez_"):
+        mic = builtin_mic()
+        if mic:
+            bridge = pw_record(["--target", mic, "-P", "{ node.name = dictate-bridge }"])
+    os.set_blocking(sys.stdin.fileno(), False)
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ, "mic")
+    if bridge:
+        sel.register(bridge.stdout, selectors.EVENT_READ, "bridge")
+    sel.register(sys.stdin, selectors.EVENT_READ, "cmd")
+    audio, pending, cmd_buf = bytearray(), b"", b""
+    early, early_pending = bytearray(), b""          # built-in mic until the headset mic is live
+    live = None if bridge else 0                     # byte offset in audio where the main mic went live
+    meter = Meter()
+    early_meter = Meter() if bridge else None
+    start = time.monotonic()
+    paused = None                                    # (main pos, early pos) where the pause began
+    spans_main, spans_early = [], []                 # paused byte spans in audio / in early
+    paused_s, paused_at = 0.0, 0.0
+    voice = {"chunks": 0, "at": time.monotonic()}  # voiced 50 ms chunks so far, when voice was last heard
+
+    def level(v):
+        out(f"L {v:.3f}")
+        if v > 0:
+            voice["chunks"] += 1
+            voice["at"] = time.monotonic()
+
+    try:
+        while True:
+            now = time.monotonic()
+            if now - start > MAX_WALL_SECONDS or \
+                    now - start - paused_s - (now - paused_at if paused else 0) > MAX_SECONDS:
+                break
+            if sp["auto_stop"] and paused is None and voice["chunks"] >= 10 \
+                    and now - voice["at"] > sp["auto_stop"]:
+                log(f"auto-stop after {sp['auto_stop']}s of silence")
+                break
+            for key, _ in sel.select(timeout=0.5):
+                if key.data == "cmd":
+                    data = os.read(sys.stdin.fileno(), 256)
+                    if not data:                      # extension went away
+                        return None
+                    cmd_buf += data
+                    *lines, cmd_buf = cmd_buf.split(b"\n")
+                    for c in lines:
+                        c = c.strip()
+                        if c == b"cancel":
+                            return None
+                        if c == b"stop":
+                            raise StopIteration
+                        if c == b"pause" and paused is None:
+                            paused = (len(audio) + len(pending), len(early))
+                            paused_at = time.monotonic()
+                        elif c == b"resume" and paused is not None:
+                            spans_main.append((paused[0], len(audio) + len(pending)))
+                            spans_early.append((paused[1], len(early)))
+                            paused_s += time.monotonic() - paused_at
+                            paused = None
+                            voice["at"] = time.monotonic()      # silence counts from the resume
+                elif key.data == "bridge":
+                    try:
+                        data = os.read(bridge.stdout.fileno(), 65536)
+                    except BlockingIOError:
+                        continue
+                    if not data:                      # built-in mic gone: just wait for the headset
+                        sel.unregister(bridge.stdout)
+                        continue
+                    early += data
+                    early_pending += data
+                    while len(early_pending) >= CHUNK:
+                        if live is None and paused is None:   # the bars show the built-in mic meanwhile
+                            level(early_meter.level(early_pending[:CHUNK]))
+                        early_pending = early_pending[CHUNK:]
+                else:
+                    try:
+                        data = os.read(proc.stdout.fileno(), 65536)
+                    except BlockingIOError:
+                        continue
+                    if not data:
+                        if live is None and early:    # headset mic never worked: keep the built-in one
+                            sel.unregister(proc.stdout)
+                            continue
+                        raise Fail("Microphone stopped")
+                    pending += data
+                    while len(pending) >= CHUNK:
+                        chunk, pending = pending[:CHUNK], pending[CHUNK:]
+                        if live is None and is_live(chunk):
+                            live = len(audio)
+                            log(f"headset mic live after {live / 2 / RATE:.2f}s, built-in mic used until then")
+                            try:
+                                sel.unregister(bridge.stdout)
+                            except KeyError:
+                                pass
+                            stop_proc(bridge)
+                            bridge = None
+                        audio += chunk
+                        if live is not None and paused is None:
+                            level(meter.level(chunk))
+    except StopIteration:
+        pass
+    finally:
+        try:
+            if meter.stats():
+                log(meter.stats())
+        except Exception:
+            pass
+        stop_proc(proc)
+        stop_proc(bridge)
+    audio += pending
+    if paused is not None:                            # stopped while paused
+        spans_main.append((paused[0], None))
+        spans_early.append((paused[1], None))
+    if spans_main:
+        cut_s = sum(((len(audio) if b is None else b) - a) for a, b in spans_main) / 2 / RATE
+        log(f"paused {len(spans_main)}x, {cut_s:.1f}s cut out")
+    if live is None:                                  # headset mic gave no sound at all
+        if early:
+            log(f"headset mic gave no sound in {len(audio) / 2 / RATE:.1f}s, built-in mic used for all")
+            return cut(bytes(early), spans_early)
+        return cut(bytes(audio), spans_main)
+    if live == 0:
+        return cut(bytes(audio), spans_main)
+    head = early[:live]
+    head += audio[len(head):live]                     # built-in mic started late: keep the zeros
+    return cut(bytes(head + audio[live:]), spans_main)
+
+
+class Meter:
+    """Voice level 0..1 per 50 ms chunk: 0 while there is only background noise (fans, room hum),
+    so the bars move only when someone speaks. Only the voice band is measured (120-2200 Hz band-pass:
+    laptop mics often have strong rumble below 80 Hz; the old pre-emphasis filter cut the voice by ~20 dB at
+    200 Hz and kept the fan hiss at 2-4 kHz, so normal speech hardly showed), the noise floor follows
+    the room (falls fast, rises only 0.5 dB/s, so fans speeding up are learned but a
+    long stretch of speech is not), and sound 5 dB above that floor for at least 100 ms shows.
+    The bar scale adapts to the voice on the microphone in use (a laptop mic hears speech ~10-25 dB above the
+    fans, a Bluetooth headset ~40-70 dB above its near-silent floor): the top of the bar follows your
+    recent loud speech (rises in ~0.5 s, falls 1 dB/s) and the bar shows the 24 dB below it, so normal
+    speech is tall, quieter speech lower. Full height (orange in the pill) only when the sound is
+    really loud in absolute terms: peaks near full scale (clipping) or very loud level.
+    stats() gives numbers for the log (no audio): how far above the floor speech was, so the gate
+    and range can be tuned on real recordings."""
+    GATE_DB = 5.0
+    RISE_DB = 0.025                                    # floor: per 50 ms chunk = 0.5 dB/s
+    WINDOW_DB = 24.0                                   # the bar shows this much below the top
+    MIN_SPAN_DB = 12.0                                 # top never closer than this to the gate
+    REF_FALL_DB = 0.05                                 # top falls 1 dB/s
+    TOP = 0.88                                         # highest bar without the orange alarm
+    RELEASE = 0.78                                     # bars rise at once, fall smoothly (~0.3 s)
+    LOUD_PEAK, LOUD_DB = 31000, -14.0                  # orange: near clipping / very loud
+
+    def __init__(self):
+        self.floor = None
+        self.ref = None
+        self.shown = 0.0
+        self.bq = [self._biquad(120, "hp"), self._biquad(2200, "lp")]
+        self.n = 0
+        self.last = 0.0
+        self.above = []                                # dB above floor, per chunk (numbers only)
+        self.floors = []
+
+    def level(self, chunk):
+        a = array.array("h")
+        a.frombytes(chunk)
+        n = len(a) or 1
+        peak = max(max(a, default=0), -min(a, default=0))
+        acc = 0.0
+        (b0, b1, b2, a1, a2, s1), (c0, c1, c2, d1, d2, s2) = self.bq
+        x1, x2, y1, y2 = s1
+        u1, u2, z1, z2 = s2
+        for x in a:                                    # high-pass then low-pass (DC is removed too)
+            y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+            x2, x1, y2, y1 = x1, x, y1, y
+            z = c0 * y + c1 * u1 + c2 * u2 - d1 * z1 - d2 * z2
+            u2, u1, z2, z1 = u1, y, z1, z
+            acc += z * z
+        s1[:] = [x1, x2, y1, y2]
+        s2[:] = [u1, u2, z1, z2]
+        db = 20 * math.log10(max(math.sqrt(acc / n), 1) / 32768)
+        self.n += 1
+        if self.floor is None or self.n <= 6:          # first 0.3 s: learn the room (mic may still settle)
+            self.floor = db if self.floor is None else min(self.floor, db)
+            return 0.0
+        if db < self.floor:
+            self.floor += (db - self.floor) * 0.3
+        else:
+            self.floor += min(self.RISE_DB, (db - self.floor) * 0.02)
+        self.above.append(db - self.floor)
+        if self.n % 20 == 0:
+            self.floors.append(self.floor)
+        gate = self.floor + self.GATE_DB
+        if db > gate:                                  # top of the scale follows loud speech
+            lo = gate + self.MIN_SPAN_DB
+            ref = max(self.ref if self.ref is not None else db + 2, lo)   # first voice sets the scale
+            self.ref = ref + (db - ref) * 0.35 if db > ref else max(lo, ref - self.REF_FALL_DB)
+        elif self.ref is not None:
+            self.ref = max(gate + self.MIN_SPAN_DB, self.ref - self.REF_FALL_DB)
+        if db <= gate:
+            v = 0.0
+        elif peak >= self.LOUD_PEAK or db >= self.LOUD_DB:
+            v = 1.0
+        else:
+            bottom = max(gate, self.ref - self.WINDOW_DB)
+            v = max(0.06, min(self.TOP, self.TOP * (db - bottom) / (self.ref - bottom)))
+        last, self.last = self.last, v
+        v = v if last > 0 else 0.0                     # one lone 50 ms click (key, desk) is not speech
+        if v < 1.0:                                    # gaps between syllables do not drop the bar to zero
+            v = min(self.TOP, max(v, self.shown * self.RELEASE))
+        self.shown = v if v >= 0.05 else 0.0
+        return self.shown
+
+    @staticmethod
+    def _biquad(f0, kind, q=0.7071):
+        w = 2 * math.pi * f0 / RATE
+        al, cw = math.sin(w) / (2 * q), math.cos(w)
+        if kind == "hp":
+            b = [(1 + cw) / 2, -(1 + cw), (1 + cw) / 2]
+        else:
+            b = [(1 - cw) / 2, 1 - cw, (1 - cw) / 2]
+        a0 = 1 + al
+        return (b[0] / a0, b[1] / a0, b[2] / a0, -2 * cw / a0, (1 - al) / a0, [0.0, 0.0, 0.0, 0.0])
+
+    def stats(self):
+        if len(self.above) < 20:
+            return ""
+        loud = sorted(x for x in self.above if x > self.GATE_DB)
+        q = lambda l, p: l[min(len(l) - 1, int(p * len(l)))] if l else 0.0
+        fl = sorted(self.floors) or [self.floor]
+        return (f"meter: floor {q(fl, 0.5):.1f} dBFS ({fl[0]:.1f}..{fl[-1]:.1f}), "
+                f"voiced {100 * len(loud) / len(self.above):.0f}% of chunks, "
+                f"above floor p50 {q(loud, 0.5):.1f} p90 {q(loud, 0.9):.1f} max {q(loud, 1.0):.1f} dB")
+
+
+def to_wav(raw):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(raw)
+    return buf.getvalue()
+
+
+# ------------------------------------------------------------------ scope
+def own_scope():
+    """Run in our own systemd scope (app-dictate-<pid>.scope), not inside GNOME Shell's cgroup:
+    system monitors then show the CPU and memory of dictation as "dictate", not as GNOME Shell's.
+    stdin/stdout pipes survive (systemd-run --scope execs in place)."""
+    try:
+        with open("/proc/self/cgroup") as f:
+            cg = f.read()
+    except OSError:
+        return
+    rt = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    if "/app-dictate-" in cg or os.environ.get("DICTATE_IN_SCOPE") or not shutil.which("systemd-run") \
+            or not os.path.exists(os.path.join(rt, "systemd", "private")):
+        return                                      # no systemd user manager: stay where we are
+    os.environ["DICTATE_IN_SCOPE"] = "1"
+    try:
+        os.execvp("systemd-run", ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--slice=app.slice",
+                                  f"--unit=app-dictate-{os.getpid()}.scope", "--", sys.executable, "-I",
+                                  os.path.abspath(__file__)] + sys.argv[1:])
+    except OSError as e:
+        log(f"own scope failed: {e}")              # carry on in the current cgroup
+
+
+# ------------------------------------------------------------------ local speech recognition
+class Recognizer:
+    """The speech model runs in a separate process (ASR_SCRIPT --worker), started when the recording
+    starts so the model (~1.8 s to load) is ready when the speaking ends, and gone afterwards (its
+    0.7-2.3 GB of memory are only used while dictating). In a container (podman/docker, image
+    dictate-asr): no network, no access to your files (only the model folder, read-only), no
+    capabilities, its output is not logged anywhere."""
+
+    def __init__(self):
+        self.proc = None
+        self.via = None
+        self.ready = None              # load time once the worker said ready
+
+    def start(self):
+        """Starts the worker without waiting for it (the recording must not be delayed)."""
+        if self.proc:
+            return
+        try:
+            with open(ASR_SCRIPT) as f:
+                code = f.read()
+        except OSError:
+            raise Fail("Speech model program missing") from None
+        variant = model_variant()
+        if not variant:
+            raise Fail(MODEL_MISSING)
+        via = runtime()
+        prefix, model = sandbox(via)
+        threads = speech()["threads"]
+        cmd = prefix + ["-c", code, "--worker", model] + (["--threads", str(threads)] if threads else []) \
+            + (["--fp32"] if variant == "fp32" else [])
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL)
+        except OSError as e:
+            raise Fail(f"Speech model failed to start ({type(e).__name__})") from None
+        self.via, self.variant, self.ready = via, variant, None
+
+    @staticmethod
+    def _line(proc, timeout):
+        """One JSON line from the worker; None if nothing within timeout (or it ended)."""
+        if timeout is not None:
+            sel = selectors.DefaultSelector()
+            sel.register(proc.stdout, selectors.EVENT_READ)
+            if not sel.select(timeout):
+                return None
+        line = proc.stdout.readline()
+        if not line:
+            return {}
+        try:
+            return json.loads(line)
+        except ValueError:
+            return {}
+
+    @staticmethod
+    def _kill(proc, loaded=True):
+        """A loaded worker ends at end of input; one still loading is stopped right away."""
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        if not loaded:
+            proc.terminate()                      # podman passes it on to the container
+        try:
+            proc.wait(3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    def transcribe(self, raw):
+        """raw: 16 kHz mono s16 bytes. Returns (text, log note)."""
+        self.start()
+        waited = time.monotonic()
+        if self.ready is None:
+            first = self._line(self.proc, LOAD_TIMEOUT_S)
+            if not first or not first.get("ready"):
+                self.close()
+                raise Fail("Speech model failed to start")
+            self.ready = first.get("load_s")
+        waited = time.monotonic() - waited
+        seconds = len(raw) / 2 / RATE
+        try:
+            sp = speech()
+            self.proc.stdin.write(json.dumps({"n": len(raw), "lang": "auto", "langs": sp["languages"],
+                                              "margin": sp["margin"], "gate_db": GATE_DB[sp["voice_gate"]]}
+                                             ).encode() + b"\n")
+            self.proc.stdin.write(raw)
+            self.proc.stdin.flush()
+        except OSError:
+            self.close()
+            raise Fail("Speech model stopped") from None
+        res = self._line(self.proc, 60 + seconds)
+        if not res or "error" in res:
+            log(f"model error via {self.via}: {(res or {}).get('error', 'no answer')}")
+            self.close()
+            raise Fail("Transcription failed")
+        note = (f"{res.get('note')}, {self.variant} via {self.via}, load {self.ready}s (waited {waited:.1f}s), "
+                f"asr {res.get('asr_s')}s")
+        return clean(res.get("text")), note
+
+    def close(self):
+        if self.proc:
+            self._kill(self.proc, self.ready is not None)
+        self.proc, self.ready = None, None
+
+
+def sandbox(via, folder=MODEL_DIR, writable=False):
+    """(argv that starts `python3 -I` for the speech model, where `folder` is seen in there).
+    The model never gets the network, in every mode:
+      podman/docker  container: no network, no capabilities, read-only, sees only the model folder
+      host + bwrap   bubblewrap: no network (own empty network namespace), sees only /usr and the
+                     model folder (read-only), not your home folder, own PID/IPC namespaces
+      host, no bwrap unshare: no network only (install bubblewrap for the rest)
+    No way to cut the network: the model does not start (fail closed).
+    writable: the folder can be written (only to convert the model to int8)."""
+    if via != "host":
+        # the int8 files must belong to you: run as your own user id (podman: mapped, not root)
+        user = ((["--userns", "keep-id"] if via == "podman" else []) +
+                ["--user", f"{os.getuid()}:{os.getgid()}"]) if writable else []
+        return ([via, "run", "--rm", "-i", "--network", "none", "--read-only", *user,
+                 "--cap-drop", "all", "--security-opt", "no-new-privileges",
+                 "--pull", "never", "--log-driver", "none", "--memory", "8g" if writable else "6g",
+                 "-v", f"{folder}:/m:{'rw' if writable else 'ro'},z", ASR_IMAGE, "python3", "-I"], "/m")
+    py = sys.executable
+    if shutil.which("bwrap"):
+        cmd = ["bwrap", "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
+               "--setenv", "PATH", "/usr/bin", "--setenv", "HOME", "/tmp",
+               "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin", "--symlink", "usr/sbin", "/sbin",
+               "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64",
+               "--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache",
+               "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+               "--bind" if writable else "--ro-bind", folder, "/m"]
+        for d in {sys.prefix, sys.base_prefix}:          # a Python outside /usr: make it visible too
+            if not d.startswith("/usr"):
+                cmd += ["--ro-bind", d, d]
+        for k in ("PARAKEET_THREADS", "PARAKEET_RU_MARGIN"):
+            if os.environ.get(k):
+                cmd += ["--setenv", k, os.environ[k]]
+        return cmd + ["--", py, "-I"], "/m"
+    if shutil.which("unshare"):
+        return ["unshare", "--net", "--map-current-user", "--", py, "-I"], folder
+    raise Fail("No sandbox for the speech model (install bubblewrap)")
+
+
+# run inside sandbox(): tries to reach the internet (by IP, so no DNS needed)
+NETCHECK = """import socket
+try:
+    socket.create_connection(("1.1.1.1", 443), 3).close(); print("OPEN")
+except OSError:
+    print("blocked")"""
+
+
+def runtime():
+    try:
+        with open(RUNTIME_FILE) as f:
+            v = f.read().strip()
+        if v in ("host", "podman", "docker"):
+            return v
+    except OSError:
+        pass
+    import importlib.util
+    if importlib.util.find_spec("onnxruntime") and importlib.util.find_spec("numpy"):
+        return "host"
+    return "podman" if shutil.which("podman") else "docker"
+
+
+def wav_pcm(wav):
+    with wave.open(io.BytesIO(wav), "rb") as w:
+        if w.getframerate() != RATE or w.getsampwidth() != 2 or w.getnchannels() != 1:
+            raise Fail("Unexpected audio format")
+        return w.readframes(w.getnframes())
+
+
+def transcribe(wav, seconds, rec=None):
+    own = rec is None
+    rec = rec or Recognizer()
+    try:
+        text, note = rec.transcribe(wav_pcm(wav))
+    finally:
+        if own:
+            rec.close()
+    text = polish(text)
+    log(f"ok local, {seconds:.1f}s audio, {len(text)} chars, {note}")
+    return text
+
+
+def keep(wav):
+    """Store the recording in RAM (tmpfs) until its text is out."""
+    os.makedirs(PENDING_DIR, mode=0o700, exist_ok=True)
+    path = os.path.join(PENDING_DIR, time.strftime("rec-%Y%m%d-%H%M%S.wav"))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(wav)
+    return path
+
+
+def cleanup_old():
+    """Delete kept recordings older than keep_minutes, and the whole history when it is off.
+    (The extension does the same every minute, also when no dictation runs.)"""
+    p = privacy()
+    keep_s = p["keep_minutes"] * 60
+    for d, everything in ((PENDING_DIR, False), (HISTORY_DIR, not p["history"])):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(d, name)
+            try:
+                if everything or (keep_s and time.time() - os.path.getmtime(path) > keep_s):
+                    os.unlink(path)
+            except OSError:
+                pass
+
+
+def remember(path, text, seconds):
+    """Keep the text (not the audio) in the history (RAM) for the extension's menu; only the newest
+    HISTORY_N stay."""
+    os.makedirs(HISTORY_DIR, mode=0o700, exist_ok=True)
+    stamp = os.path.basename(path)[:-4]
+    meta = {"time": int(os.path.getmtime(path)), "seconds": round(seconds, 1), "text": text}
+    tmp = os.path.join(HISTORY_DIR, f".{stamp}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(meta, f, ensure_ascii=False)
+    os.replace(tmp, os.path.join(HISTORY_DIR, stamp + ".json"))
+    os.unlink(path)
+    stamps = sorted(n[:-5] for n in os.listdir(HISTORY_DIR) if n.endswith(".json"))
+    for old in stamps[:-HISTORY_N]:
+        try:
+            os.unlink(os.path.join(HISTORY_DIR, old + ".json"))
+        except FileNotFoundError:
+            pass
+
+
+def discard(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+# ------------------------------------------------------------------ model files
+MODEL_MISSING = "Speech model not installed: Settings, page Speech"
+
+
+def installed(variant):
+    names = COMMON_FILES + VARIANTS[variant]
+    return all(os.path.isfile(os.path.join(MODEL_DIR, n)) and
+               (n not in MODEL_FILES or os.path.getsize(os.path.join(MODEL_DIR, n)) == MODEL_FILES[n][0])
+               for n in names)
+
+
+def model_variant():
+    """The variant chosen in Settings if it is installed, else the other one, else None."""
+    want = speech()["model"]
+    return next((v for v in (want, *VARIANTS) if installed(v)), None)
+
+
+def models():
+    """For the settings window: what is installed, what a download costs."""
+    def disk(v):
+        return sum(os.path.getsize(os.path.join(MODEL_DIR, n)) for n in VARIANTS[v]
+                   if os.path.isfile(os.path.join(MODEL_DIR, n)))
+    fp32 = sum(MODEL_FILES[n][0] for n in FP32_FILES)
+    common = sum(MODEL_FILES[n][0] for n in COMMON_FILES)
+    print(json.dumps({
+        "dir": MODEL_DIR, "source": MODEL_URL, "chosen": speech()["model"], "used": model_variant(),
+        "busy": locked(),
+        "variants": {
+            "int8": {"installed": installed("int8"), "disk": disk("int8"), "size": INT8_SIZE + common,
+                     "download": fp32 + common, "memory_gb": QUANTIZE_MEMORY_GB},
+            "fp32": {"installed": installed("fp32"), "disk": disk("fp32"), "size": fp32 + common,
+                     "download": fp32 + common},
+        }}))
+
+
+def locked():
+    """True while another `dictate --download` runs."""
+    import fcntl
+    try:
+        with open(os.path.join(MODEL_DIR, ".lock"), "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+
+
+class Progress:
+    """Progress lines for the settings window ("P <stage> <done> <total>"), or a bar in a terminal."""
+
+    def __init__(self, stage, total):
+        self.stage, self.total, self.done, self.last = stage, total, 0, 0.0
+        self.tty = sys.stdout.isatty()
+
+    def add(self, n):
+        self.done += n
+        now = time.monotonic()
+        if now - self.last >= 0.25 or self.done >= self.total:
+            self.last = now
+            if self.tty:
+                pct = 100 * self.done / max(self.total, 1)
+                sys.stdout.write(f"\r{self.stage}: {self.done / 1e9:.2f} of {self.total / 1e9:.2f} GB "
+                                 f"({pct:.0f}%)" + ("\n" if self.done >= self.total else ""))
+                sys.stdout.flush()
+            else:
+                out(f"P {self.stage} {self.done} {self.total}")
+
+
+def sha256_of(path, progress=None):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while block := f.read(1 << 20):
+            h.update(block)
+            if progress:
+                progress.add(len(block))
+    return h.hexdigest()
+
+
+def fetch(name, dest_dir, progress):
+    """Download one model file into dest_dir (resuming a partial download) and check its SHA-256."""
+    import urllib.error
+    import urllib.request
+    size, digest = MODEL_FILES[name]
+    path = os.path.join(dest_dir, name)
+    if os.path.isfile(path) and os.path.getsize(path) == size and sha256_of(path) == digest:
+        progress.add(size)
+        return path
+    part = path + ".part"
+    have = os.path.getsize(part) if os.path.isfile(part) else 0
+    if have > size:
+        os.unlink(part)
+        have = 0
+    progress.add(have)
+    if have < size:
+        req = urllib.request.Request(MODEL_URL + name, headers={"User-Agent": "dictator-model-download"})
+        if have:
+            req.add_header("Range", f"bytes={have}-")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                if have and r.status != 206:                # the server sends it all again
+                    progress.add(-have)
+                    have = 0
+                with open(part, "ab" if have else "wb") as f:
+                    while block := r.read(1 << 20):
+                        f.write(block)
+                        progress.add(len(block))
+        except (urllib.error.URLError, OSError) as e:
+            raise Fail(f"Download failed ({getattr(e, 'reason', e)}). Try again: it continues "
+                       "where it stopped") from None
+    if sha256_of(part) != digest:
+        os.unlink(part)
+        raise Fail(f"{name}: the downloaded file is not the expected one (SHA-256 differs). Deleted it")
+    os.replace(part, path)
+    return path
+
+
+def download(variant):
+    """Install a model variant. fp32: download it. int8: download the fp32 files into a work folder,
+    convert them on this computer (in the sandbox, no network), keep the int8 files, delete the rest."""
+    import fcntl
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    lock = open(os.path.join(MODEL_DIR, ".lock"), "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Fail("A download is already running") from None
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))   # cancelled: the finally blocks clean up
+    work = os.path.join(MODEL_DIR, ".work")
+    fp32 = sum(MODEL_FILES[n][0] for n in FP32_FILES)
+    need = sum(MODEL_FILES[n][0] for n in COMMON_FILES) + fp32 + (INT8_SIZE if variant == "int8" else 0)
+    if shutil.disk_usage(MODEL_DIR).free < need - partial_bytes(work) + 200_000_000:
+        raise Fail(f"Not enough free disk space: {need / 1e9:.1f} GB needed in {MODEL_DIR}")
+    if variant == "int8":
+        if free_memory_gb() < QUANTIZE_MEMORY_GB:
+            raise Fail(f"Not enough free memory to convert the model: {QUANTIZE_MEMORY_GB} GB needed. "
+                       "Close some apps and try again")
+        check_runtime(convert=True)
+    log(f"model download: {variant}")
+    progress = Progress("download", need - (INT8_SIZE if variant == "int8" else 0))
+    for name in COMMON_FILES:
+        fetch(name, MODEL_DIR, progress)
+    if variant == "fp32":
+        for name in FP32_FILES:
+            fetch(name, MODEL_DIR, progress)
+    else:
+        os.makedirs(work, exist_ok=True)
+        for name in FP32_FILES:
+            have = os.path.join(MODEL_DIR, name)        # fp32 installed already: no second download
+            if installed("fp32") and not os.path.exists(os.path.join(work, name)):
+                os.link(have, os.path.join(work, name))
+            fetch(name, work, progress)
+        quantize(work)
+        same = True
+        for name in INT8_FILES:
+            same &= sha256_of(os.path.join(work, name)) == INT8_REFERENCE[name]
+            os.replace(os.path.join(work, name), os.path.join(MODEL_DIR, name))
+        shutil.rmtree(work)
+        log(f"model int8 {'identical to' if same else 'differs slightly from'} the reference build")
+    write_notice()
+    log(f"model {variant} installed")
+    if sys.stdout.isatty():
+        print("The speech model is installed.")
+    else:
+        out("D")
+
+
+def partial_bytes(work):
+    try:
+        return sum(os.path.getsize(os.path.join(work, n)) for n in os.listdir(work))
+    except OSError:
+        return 0
+
+
+def free_memory_gb():
+    try:
+        with open("/proc/meminfo") as f:
+            info = dict(line.split(":", 1) for line in f)
+        return int(info["MemAvailable"].split()[0]) / 1024 / 1024
+    except (OSError, KeyError, ValueError):
+        return QUANTIZE_MEMORY_GB
+
+
+def check_runtime(convert=False):
+    """Fail early, with the fix, when the model's runtime cannot run (or cannot convert)."""
+    via = runtime()
+    if via == "host":
+        import importlib.util
+        mods = ["onnxruntime", "numpy"] + (["onnx"] if convert else [])
+        missing = [m for m in mods if not importlib.util.find_spec(m)]
+        if missing:
+            raise Fail("System Python lacks " + ", ".join(f"python3-{m}" for m in missing) +
+                       ": install it with your package manager")
+    elif not shutil.which(via) or subprocess.run([via, "image", "inspect", ASR_IMAGE],
+                                                 capture_output=True).returncode:
+        raise Fail(f"The {via} image {ASR_IMAGE} is missing: run install.sh again")
+    elif convert and subprocess.run(sandbox(via)[0] + ["-c", "import onnx"], capture_output=True).returncode:
+        raise Fail(f"The {via} image {ASR_IMAGE} is from an older Dictator: run install.sh again")
+
+
+def quantize(work):
+    """parakeet.py --quantize in the sandbox (no network), with the work folder writable."""
+    try:
+        with open(ASR_SCRIPT) as f:
+            code = f.read()
+    except OSError:
+        raise Fail("Speech model program missing") from None
+    if sys.stdout.isatty():
+        print("Converting to int8 on this computer (about a minute)...")
+    else:
+        out("P convert 0 1")
+    prefix, folder = sandbox(runtime(), work, writable=True)
+    proc = subprocess.Popen(prefix + ["-c", code, "--quantize", folder], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True)
+    try:
+        res, _ = proc.communicate(timeout=1800)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait()
+    try:
+        res = json.loads(res.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        res = {"error": f"exit code {proc.returncode}" + (" (out of memory?)" if proc.returncode in (-9, 137)
+                                                          else "")}
+    if "error" in res:
+        log(f"quantize failed: {res['error']}")
+        raise Fail(f"Converting the model failed: {res['error']}")
+    if not sys.stdout.isatty():
+        out("P convert 1 1")
+
+
+def write_notice():
+    with open(os.path.join(MODEL_DIR, "NOTICE.txt"), "w") as f:
+        f.write(f"""Speech model: NVIDIA Parakeet TDT 0.6B v3
+  Original: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+  Copyright NVIDIA Corporation. License: Creative Commons Attribution 4.0 International (CC BY 4.0),
+  https://creativecommons.org/licenses/by/4.0/
+
+Changes made to the original:
+  1. Converted to the ONNX format by the onnx-asr project: {MODEL_URL.replace('/resolve/', '/tree/')}
+  2. encoder-model.int8.onnx, decoder_joint-model.int8.onnx (if present): made on this computer by
+     Dictator from the files of step 1, with onnxruntime dynamic quantization (8-bit integers, per
+     channel, MatMul layers only).
+
+Dictator is not affiliated with, sponsored or endorsed by NVIDIA.
+""")
+
+
+def remove(variant):
+    for name in VARIANTS[variant]:
+        discard(os.path.join(MODEL_DIR, name))
+    shutil.rmtree(os.path.join(MODEL_DIR, ".work"), ignore_errors=True)   # a cancelled int8 download
+    if not any(installed(v) for v in VARIANTS):
+        shutil.rmtree(MODEL_DIR, ignore_errors=True)
+    log(f"model {variant} removed")
+
+
+def model_command(cmd, variant):
+    try:
+        if variant not in VARIANTS:
+            raise Fail(f"Unknown model variant {variant!r} (int8 or fp32)")
+        (download if cmd == "--download" else remove)(variant)
+    except Fail as e:
+        print(f"Error: {e}" if sys.stdout.isatty() else f"E {e}", flush=True)
+        sys.exit(1)
+
+
+def main():
+    cleanup_old()
+    path = None
+    rec = Recognizer()
+    try:
+        try:
+            rec.start()                                   # loads while you speak
+        except Fail as e:
+            if str(e) == MODEL_MISSING:                   # nothing to transcribe with: do not record
+                out(f"E {e}")
+                return
+            log(f"model start: {e}")                      # record anyway; the recording is kept
+        raw = record()
+        if raw is None:
+            return
+        seconds = len(raw) / 2 / RATE
+        if seconds < MIN_SECONDS:
+            raise Fail("Too short")
+        wav = to_wav(raw)
+        del raw
+        path = keep(wav)
+        out("S")
+        text = transcribe(wav, seconds, rec=rec)
+        rec.close()
+        if not text:
+            os.unlink(path)
+            path = None
+            raise Fail("No speech recognised")
+        out("T " + json.dumps(text, ensure_ascii=False))
+        try:
+            if privacy()["history"]:
+                remember(path, text, seconds)
+        except OSError as e:
+            log(f"history: {e}")
+        discard(path)                                     # the audio is never kept after its text
+        path = None
+    except Fail as e:
+        if path and str(e) == "No speech recognised":      # silence: nothing worth keeping
+            os.unlink(path)
+            path = None
+        out(f"E {e}" + (", recording kept, menu: Retry" if path else ""))
+    except Exception as e:                                # never leave the overlay hanging
+        log(f"crash: {type(e).__name__}: {e}")
+        out(f"E {type(e).__name__}" + (", recording kept, menu: Retry" if path else ""))
+    finally:
+        rec.close()
+
+
+def retry():
+    """Transcribe the kept (failed) recordings again. Prints S, then one T line per text (or E), like a
+    recording: the extension shows them in the microphone menu. Never touches the clipboard."""
+    cleanup_old()
+    try:
+        files = sorted(f for f in os.listdir(PENDING_DIR) if f.endswith(".wav"))
+    except OSError:
+        files = []
+    if not files:
+        out("E No saved recordings")
+        return
+    out("S")
+    history = privacy()["history"]
+    rec = Recognizer()
+    try:
+        for name in files:
+            p = os.path.join(PENDING_DIR, name)
+            with open(p, "rb") as f:
+                wav = f.read()
+            seconds = (len(wav) - 44) / 2 / RATE
+            try:
+                text = transcribe(wav, seconds, rec=rec)
+            except Fail as e:          # keep this one and the rest
+                out(f"E Still failing: {e}")
+                return
+            if text:
+                out("T " + json.dumps(text, ensure_ascii=False))
+                if history:
+                    try:
+                        remember(p, text, seconds)
+                    except OSError as e:
+                        log(f"history: {e}")
+            discard(p)
+    finally:
+        rec.close()
+
+
+def selftest():
+    """Starts the model and transcribes 1 s of silence: checks the runtime and the model files."""
+    t0 = time.monotonic()
+    rec = Recognizer()
+    try:
+        text, note = rec.transcribe(b"\0\0" * RATE)
+        print(f"OK: the speech model works ({note}, {time.monotonic() - t0:.1f}s in all)")
+        prefix, _ = sandbox(rec.via)
+        try:
+            net = subprocess.run(prefix + ["-c", NETCHECK], capture_output=True, text=True,
+                                 timeout=60).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            net = "?"
+        if net != "blocked":
+            raise Fail(f"the speech model's sandbox does not block the network (got {net!r})")
+        print(f"OK: no network for the speech model ({prefix[0]} sandbox)")
+    except Fail as e:
+        print(f"FAILED: {e}. Details: ~/.cache/dictate/dictate.log")
+        sys.exit(1)
+    finally:
+        rec.close()
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] not in (["--models"], ["--remove"]):
+        own_scope()
+    if sys.argv[1:] == ["--selftest"]:
+        selftest()
+    elif sys.argv[1:] == ["--retry"]:
+        retry()
+    elif sys.argv[1:] == ["--models"]:
+        models()
+    elif sys.argv[1:2] in (["--download"], ["--remove"]) and len(sys.argv) == 3:
+        model_command(sys.argv[1], sys.argv[2])
+    else:
+        main()

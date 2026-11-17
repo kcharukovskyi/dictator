@@ -1,0 +1,9 @@
+# Runtime for the speech model (image "dictate-asr"), built on your computer by install.sh when the
+# system Python has no onnxruntime + numpy. Only signed Fedora packages, nothing else. python3-onnx is
+# only needed to convert the model to 8-bit (dictate --download int8).
+# Base pinned by digest (multi-arch index), so it cannot change under you. To update it:
+#   skopeo inspect --format '{{.Digest}}' docker://registry.fedoraproject.org/fedora-minimal:44
+FROM registry.fedoraproject.org/fedora-minimal:44@sha256:bab880dd1b156a65b611b1d5f69ebdbf92382f78d26ee3bf1eb47648b2fa46fa
+RUN dnf -y install --setopt=install_weak_deps=False --nodocs python3-onnxruntime python3-onnx python3-numpy && dnf clean all
+# the model runs as an unprivileged user, not root
+USER 65534:65534

@@ -1,0 +1,71 @@
+# Notes for extensions.gnome.org reviewers
+
+Upload `dist/dictator@kcharukovskyi.github.io.shell-extension.zip`, which `scripts/pack.sh` builds.
+Paste the section below into the review comment, and keep it true when the code changes.
+
+---
+
+**What it does.** Offline voice dictation. The extension draws the UI: a pill at the bottom of the
+screen, a top-bar icon with a menu, and the preferences window. It talks to a separate helper program
+over stdin and stdout. The helper records with `pw-record` and runs a speech model in a sandbox
+without network access.
+
+**Why a helper outside the extension.** Speech recognition needs ONNX Runtime and NumPy, which have no
+GJS bindings, and a model of about 1 GB.
+- The helper is readable Python, licensed GPL-3.0-or-later, and runs unprivileged:
+  https://github.com/kcharukovskyi/dictator/tree/main/helper
+- The extension does not install or download the helper. The user installs it from the repository
+  with `install.sh`. Without it, the extension says so and links to the instructions.
+
+**Subprocesses.**
+- `core.js` spawns `~/.local/bin/dictate` with `Gio.Subprocess`, only when the user starts a recording
+  or presses Retry in the menu. The process exits when the recording is finished or cancelled.
+- `disable()` cancels a running recording and calls `force_exit()` on a running Retry.
+- `kitten @ ls/focus-window` (kitty's own CLI) is run only if kitty is installed, to return to the
+  right tab. It is killed after 3 s.
+- `prefs.js` runs `dictate --models`, `--download` and `--remove` for the Speech Model section.
+
+**Network.** The extension has no network access.
+- The model download is in the helper. It runs only after the user clicks Download in preferences
+  (or answers yes in `install.sh`).
+- It fetches fixed files from a pinned Hugging Face revision and checks each one against a hard-coded
+  SHA-256.
+- These are model weights, not code.
+- Closing the preferences window stops the download.
+
+**Why `unlock-dialog`.** If the screen locks during a recording, disabling the extension would kill the
+helper and lose what the user said. With `unlock-dialog`, locking finishes and transcribes the
+recording, and the text waits in memory until the unlock. While the screen is locked:
+- Every keyboard signal and accelerator grab is disconnected: `_disconnectKeys()` in `extension.js`
+  and `_disconnectKeyboard()` in `core.js`.
+- The indicator and the pill are hidden, and nothing is typed.
+
+Everything is reconnected on unlock. `disable()` releases everything in either session mode (see the
+comment in `extension.js`).
+
+**Typing text.**
+- Text goes in with `Main.inputMethod.commit()`, like the on-screen keyboard. It goes only into the
+  window that had the focus when the recording started.
+- The text is sanitised first: control, bidi and zero-width characters are removed.
+- A virtual keyboard (`Clutter.Seat.create_virtual_device`) is used only to put Caps Lock back after it
+  served as the pause key, and for Ctrl+V when the user has turned on clipboard pasting in
+  preferences.
+
+**Clipboard.** Declared in the description. The clipboard is written only in two cases:
+- when the user clicks a past text in the top-bar menu (copy);
+- when the user has turned on "Paste Through the Clipboard" (off by default), for apps without text
+  input support.
+
+In the second case the previous clipboard content is restored afterwards, and password-manager entries
+are never put back. No default shortcut acts on the clipboard.
+
+**Monkey-patching.** The `showOSD` method of the quick-settings output slider instance is replaced
+while recording. A Bluetooth headset switches profile when the microphone opens, and GNOME would flash
+the volume OSD several times. `disable()` restores the method (`_unpatchOsd`).
+
+**Settings storage.** Settings are plain files in `~/.config/dictate` rather than GSettings, because
+the Python helper reads the same files without GObject bindings. `prefs.js` writes them, and
+`extension.js` watches the keys file so that shortcut changes apply at once.
+
+**Logging.** Only warnings and errors are logged. Per-dictation notes use `console.debug` and never
+contain the text.

@@ -1,18 +1,15 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: 2025-2026 The Dictator authors (see AUTHORS)
-// Voice dictation, loader. All the logic is in core.js (see there), loaded once at log in. (It used to
-// be reloaded whenever core.js changed on disk: that let a changed file take over the code that types
-// for you without a log in, so it is gone; a new core.js needs a log out and in, like any extension.)
-// Keys: ~/.config/dictate/keys (see keys.js; the settings window prefs.js writes it). This file grabs
-// the start shortcut(s) and watches that file: a change is applied at once, no log out. A shortcut
-// that cannot be grabbed (wrong name, or taken by GNOME / another app) is reported in a notification.
+// Dictator: offline voice dictation. This file grabs the start shortcut(s) from ~/.config/dictate/keys
+// (see keys.js) and watches that file, so a change applies at once; a shortcut that cannot be grabbed
+// (taken by GNOME or another app) is reported in a notification. Everything else is in core.js.
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
-import {readKeys, prettyAccel, gnomeShortcuts, takenBy, DEFAULTS, KEYS_FILE, OLD_FILE} from './keys.js';
+import {readKeys, prettyAccel, gnomeShortcuts, takenBy, DEFAULTS, KEYS_FILE} from './keys.js';
 import {Core} from './core.js';
 
 export default class Dictator extends Extension {
@@ -111,7 +108,7 @@ export default class Dictator extends Extension {
         try {
             dir.make_directory_with_parents(null);
         } catch (e) {}              // already there
-        const names = [GLib.path_get_basename(KEYS_FILE), GLib.path_get_basename(OLD_FILE)];
+        const name = GLib.path_get_basename(KEYS_FILE);
         try {
             this._monitor = dir.monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, null);
         } catch (e) {
@@ -119,7 +116,7 @@ export default class Dictator extends Extension {
             return;
         }
         this._monitor.connect('changed', (m, file, other) => {
-            if (![file, other].some(f => f && names.includes(f.get_basename())))
+            if (![file, other].some(f => f?.get_basename() === name))
                 return;
             if (this._regrabId)     // a save is several events: act once, a moment later
                 GLib.source_remove(this._regrabId);

@@ -1,29 +1,15 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: 2025-2026 The Dictator authors (see AUTHORS)
-// Voice dictation. Keys (defaults; all changeable in the settings window / ~/.config/dictate/keys, see
-// keys.js): the shortcut (Ctrl+Alt+Space, grabbed by extension.js) starts recording, the shortcut again
-// finishes, Esc cancels.
-// While recording, a Caps Lock press pauses (what is said meanwhile is cut out by the helper), the next
-// one resumes. Those presses do not change Caps Lock: every Caps press during dictation toggles the
-// lock, and the lock is put back to the state before the first of them (~0.7 s after the last one).
-// Outside dictation a Caps press is a normal Caps Lock. With another pause key, Caps Lock stays normal.
-// The cancel and pause keys are grabbed only while recording (so they never reach the app then).
-// A pill at the bottom of the screen where you type (monitor of the focused window) shows the voice
-// level (bars), how long the recording is, and then the status. The helper ~/.local/bin/dictate records
-// and turns speech into text on this computer (no network); its protocol is documented there.
-// The text is put into the clipboard and pasted (Ctrl+V; Ctrl+Shift+V in terminals) where the cursor
-// was when you STARTED speaking: the extension remembers that window, brings it back to the front and
-// pastes there, wherever you are when you finish; after the paste the clipboard gets back what it held
-// before. In kitty it also remembers the tab when kitty allows remote control (optional, see the
-// README). If that window is gone or does not take focus, nothing is pasted and the text stays in the
-// clipboard. Screen lock: the recording is finished (no listening behind the lock), nothing is shown
-// or pasted there, the text goes to the clipboard after the unlock. Audio never touches the disk.
-// Top bar: a microphone (red while recording, yellow while paused); its menu lists the last 3
-// recordings (kept by the helper in RAM only): copy the text, or transcribe one again (auto / as
-// Ukrainian / as Russian / as English), the new text goes to the clipboard. Failed recordings: Retry.
-// This file is the logic; extension.js loads it once (at log in) and passes the shortcut here. A changed
-// core.js is NOT picked up before the next log in (no silent swap of the code that can type for you).
-// Kept recordings (history, failed ones) are deleted after the time set in the settings window.
+// The dictation itself: the helper process, the keys while recording, putting the text into the app,
+// the pill on screen and the top-bar menu.
+//
+// A recording: the start shortcut runs the helper (~/.local/bin/dictate, see helper/dictate in the
+// project), which records and prints the voice level, then the text. The text goes to the window that
+// had the focus when the recording started: it is typed in through the input method (like the
+// on-screen keyboard), never into another window and never on the lock screen. An app that takes no
+// typed text gets a Ctrl+V paste through the clipboard only if the user allowed it in Settings;
+// otherwise the text waits in the top-bar menu.
+// While recording, Caps Lock pauses (by default): the lock itself is put back as it was.
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import Graphene from 'gi://Graphene';
@@ -43,10 +29,8 @@ const PENDING_DIR = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'dictate'
 const HISTORY_DIR = `${PENDING_DIR}-history`;
 const BADGE_ICON = {rec: 'audio-input-microphone-symbolic', pause: 'media-playback-pause-symbolic',
     done: 'object-select-symbolic', error: 'dialog-warning-symbolic'};
-// a theme colour (Cogl.Color; Clutter.Color before GNOME 47) as [r, g, b, a] in 0..1
-const rgba = c => (typeof c.get_red === 'function'
-    ? [c.get_red(), c.get_green(), c.get_blue(), c.get_alpha()]
-    : [c.red / 255, c.green / 255, c.blue / 255, c.alpha / 255]);
+// a theme colour as [r, g, b, a] in 0..1
+const rgba = c => [c.get_red(), c.get_green(), c.get_blue(), c.get_alpha()];
 const BARS = 32;
 const LEVEL_MS = 50;            // the helper sends one voice level per 50 ms of audio
 const FRAME_MS = 33;            // the wave is redrawn at most ~30 times a second, only while it moves
@@ -79,22 +63,14 @@ const OSD_QUIET_AFTER_US = 10 * 1000000;
 const CLIPBOARD_RESTORE_MS = 1500;
 const CLIPBOARD_READ_MS = 500;
 const IM_SETTLE_MS = 150;     // let a re-focused text field reach the input method first
-const HISTORY_N = 3;      // the most to wait for the old clipboard content before pasting
+const HISTORY_N = 3;          // texts in the top-bar menu
 const TEXT_MIMES = ['text/plain;charset=utf-8', 'UTF8_STRING', 'text/plain', 'STRING', 'TEXT'];
 const SECRET_MIME = 'x-kde-passwordManagerHint';
 
 export class Core {
-    // opts.openPrefs: opens the settings window (keys); given by extension.js
+    // opts.openPrefs: opens the settings window; given by extension.js
     constructor(opts = {}) {
         this._opts = opts;
-    }
-
-    get busy() {
-        return !!this._state;
-    }
-
-    chord() {
-        this._chord();
     }
 
     enable() {
@@ -104,9 +80,7 @@ export class Core {
         this._phase = 0;                    // 0..1: how far the next bar has scrolled in
         this._grabs = new Map();             // action id -> handler (Esc while recording)
         this._accelId = this._keymapId = 0;
-        // GNOME 51 removed Clutter.get_default_backend(); the stage's context has the backend
-        const backend = global.stage.get_context?.()?.get_backend() ?? Clutter.get_default_backend();
-        const seat = backend.get_default_seat();
+        const seat = global.stage.get_context().get_backend().get_default_seat();
         this._kbd = seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
         this._keymap = seat.get_keymap();
         // [time, state after, made by us]
@@ -259,8 +233,9 @@ export class Core {
         [...codes].reverse().forEach((c, i) => this._kbd.notify_key(t + 100 + i, c, Clutter.KeyState.RELEASED));
     }
 
-    // the shortcut: start or finish (a Caps press right around it is absorbed, not a pause)
-    _chord() {
+    // the start shortcut (from extension.js): start, or finish (a Caps press right around it is
+    // absorbed, not a pause)
+    chord() {
         if (this._locked)
             return;
         const t = GLib.get_monotonic_time();
@@ -408,19 +383,16 @@ export class Core {
         // the app that owns the clipboard has to send it; one that hangs must not stop the paste:
         // after CLIPBOARD_READ_MS paste anyway, and leave the clipboard as it is then (saved: undefined)
         let answered = false;
-        const giveUp = GLib.timeout_add(GLib.PRIORITY_DEFAULT, CLIPBOARD_READ_MS, () => {
-            if (!answered && this._kbd) {
-                answered = true;
-                this._note('the clipboard owner did not answer: pasting without restoring the clipboard');
-                done(undefined);
-            }
-            return GLib.SOURCE_REMOVE;
+        const giveUp = this._act(CLIPBOARD_READ_MS, () => {
+            answered = true;
+            this._note('the clipboard owner did not answer: pasting without restoring the clipboard');
+            done(undefined);
         });
         cb.get_content(St.ClipboardType.CLIPBOARD, mime, (c, bytes) => {
             if (answered || !this._kbd)     // too late, or the extension was disabled meanwhile
                 return;
             answered = true;
-            GLib.source_remove(giveUp);
+            this._unact(giveUp);
             const data = bytes?.get_size() ? bytes : null;
             if (!data)
                 done(null);
@@ -472,6 +444,8 @@ export class Core {
 
     // ------------------------------------------------------------ helper process
     _start() {
+        if (!this._helperThere())
+            return;
         try {
             this._proc = Gio.Subprocess.new([HELPER],
                 Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE);
@@ -492,6 +466,15 @@ export class Core {
                 this._finish();
         });
         this._showRecording();
+    }
+
+    // the helper is installed separately (it cannot come with the extension): say so if it is not
+    _helperThere() {
+        if (GLib.file_test(HELPER, GLib.FileTest.IS_EXECUTABLE))
+            return true;
+        this._pickMonitor();
+        this._show('error', 'The speech engine is not installed: microphone menu → Settings', 5000);
+        return false;
     }
 
     _send(cmd) {
@@ -518,6 +501,9 @@ export class Core {
             return;
         this._quietOsd();
         this._send('cancel');
+        try {
+            this._stdin?.close(null);       // the helper also ends at the end of its input
+        } catch (e) {}
         this._finish();
         this._target = null;
         this._hide();
@@ -619,15 +605,9 @@ export class Core {
             done(null);
             return;
         }
-        let finished = false;
-        const kill = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 3000, () => {
-            if (!finished)
-                proc.force_exit();
-            return GLib.SOURCE_REMOVE;
-        });
+        const kill = this._act(3000, () => proc.force_exit());
         proc.communicate_utf8_async(null, null, (p, res) => {
-            finished = true;
-            GLib.source_remove(kill);
+            this._unact(kill);
             let out = null;
             try {
                 const [, stdout] = p.communicate_utf8_finish(res);
@@ -642,14 +622,14 @@ export class Core {
         return !!win && global.get_window_actors().some(a => a.meta_window === win);
     }
 
-    // what happened to a text, in the journal (journalctl --user -b | grep dictation): the app, the
-    // keys, the keyboard layout. Never the text itself.
+    // what happened to a text, for debugging (a debug message: shown only with G_MESSAGES_DEBUG): the
+    // app, the keys, the keyboard layout. Never the text itself.
     _note(msg) {
         let layout = '?';
         try {
             layout = Keyboard.getInputSourceManager().currentSource?.id ?? '?';
         } catch (e) {}
-        console.log(`dictator: ${msg} [layout ${layout}]`);
+        console.debug(`dictator: ${msg} [layout ${layout}]`);
     }
 
     // Put the text where the recording started (never into another window). It is typed in through the
@@ -927,7 +907,7 @@ export class Core {
 
     // transcribe the failed recordings again; the texts go to the menu
     _retry() {
-        if (this._state || this._retryProc)
+        if (this._state || this._retryProc || !this._helperThere())
             return;
         let proc;
         try {
@@ -1245,7 +1225,7 @@ export class Core {
         this._timers.add(id);
     }
 
-    // timers for key actions (Caps off, paste): not cancelled by UI changes
+    // timers for actions (Caps off, paste, timeouts): not cancelled by UI changes, only by disable()
     _act(ms, fn) {
         this._acts ??= new Set();
         const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
@@ -1254,6 +1234,12 @@ export class Core {
             return GLib.SOURCE_REMOVE;
         });
         this._acts.add(id);
+        return id;
+    }
+
+    _unact(id) {
+        if (this._acts?.delete(id))
+            GLib.source_remove(id);
     }
 
     _clearTimers() {

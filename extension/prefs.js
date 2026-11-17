@@ -1,10 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: 2025-2026 The Dictator authors (see AUTHORS)
-// Settings window. Opens from the top-bar microphone menu ("Settings") or with:
-// gnome-extensions prefs <uuid>. Two pages:
-//   General  keys (~/.config/dictate/keys: the extension watches it and applies a change at once;
-//            shortcuts GNOME already owns are refused) and privacy (~/.config/dictate/privacy)
-//   Speech   languages, text, performance (~/.config/dictate/speech, replacements); see keys.js
+// Settings window (top-bar microphone menu -> Settings). Two pages:
+//   General  shortcuts, privacy, appearance
+//   Speech   the speech model (download / remove, through the helper), languages, text, recording
+// Settings are saved in ~/.config/dictate (see keys.js).
 import Adw from 'gi://Adw';
 import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
@@ -19,6 +18,30 @@ const STOP_CHOICES = [[0, 'Off'], [2, 'After 2 seconds'], [3, 'After 3 seconds']
     [10, 'After 10 seconds']];
 const GATE_CHOICES = [['off', 'Off'], ['light', 'Light'], ['medium', 'Medium'], ['strong', 'Strong']];
 const PILL_CHOICES = [['bottom', 'Bottom'], ['top', 'Top']];
+const HELPER = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'dictate']);
+const REPO = 'https://github.com/kcharukovskyi/dictator';
+const VARIANTS = [
+    {id: 'int8', title: 'Standard', note: v => `Recommended. Takes ${gb(v.size)}. Made on this computer from a ` +
+        `${gb(v.download)} download, which needs ${v.memory_gb} GB of free memory for about a minute`},
+    {id: 'fp32', title: 'Full Precision', note: v => `Slightly more accurate, about half as fast. ` +
+        `${gb(v.download)} download, takes ${gb(v.size)}`},
+];
+
+const gb = bytes => `${(bytes / 1e9).toFixed(1)} GB`;
+
+// what the helper says about the model files (see helper/dictate --models), or null without the helper
+function modelInfo() {
+    if (!GLib.file_test(HELPER, GLib.FileTest.IS_EXECUTABLE))
+        return null;
+    try {
+        const proc = Gio.Subprocess.new([HELPER, '--models'],
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
+        const [, out] = proc.communicate_utf8(null, null);
+        return JSON.parse(out);
+    } catch (e) {
+        return null;
+    }
+}
 
 // [[source name, description]] of the real microphones (not monitors of outputs), from PipeWire
 function microphones() {
@@ -47,7 +70,6 @@ function choiceRow(props, choices, current, onChange) {
     row.connect('notify::selected', () => onChange(list[row.selected]?.[0] ?? current));
     return row;
 }
-const REPO = 'https://github.com/kcharukovskyi/dictator';
 
 // how long kept recordings stay (minutes; 0 = until a restart)
 const KEEP_CHOICES = [[15, '15 minutes'], [60, '1 hour'], [480, '8 hours'], [0, 'Until a restart']];
@@ -158,7 +180,10 @@ export default class DictatorPrefs extends ExtensionPreferences {
         page.add(this._privacyGroup());
         page.add(this._appearanceGroup());
         page.add(this._aboutGroup());
-        window.add(this._speechPage());
+        const [speech, ready] = this._speechPage(window);
+        window.add(speech);
+        if (!ready)                 // the model (or the helper) is still missing: start there
+            window.set_visible_page(speech);
     }
 
     _appearanceGroup() {
@@ -180,11 +205,16 @@ export default class DictatorPrefs extends ExtensionPreferences {
         return group;
     }
 
-    _speechPage() {
+    _speechPage(window) {
         const page = new Adw.PreferencesPage({title: 'Speech', icon_name: 'audio-input-microphone-symbolic'});
         const sp = readSpeech();
-        // the General page writes the indicator position into the same file: keep what is there
-        const save = () => writeSpeech({...sp, pill: readSpeech().pill});
+        // the indicator position and the model are saved into the same file elsewhere: keep them
+        const save = () => {
+            const now = readSpeech();
+            writeSpeech({...sp, pill: now.pill, model: now.model});
+        };
+        const [model, ready] = this._modelGroup(window);
+        page.add(model);
 
         // languages: the main one first, then the others in the table's order
         const langs = new Adw.PreferencesGroup({title: 'Languages',
@@ -323,7 +353,167 @@ export default class DictatorPrefs extends ExtensionPreferences {
         });
         perf.add(threads);
         page.add(perf);
-        return page;
+        return [page, ready];
+    }
+
+    // The model: one row per variant (use it / download / remove). Downloading and converting are done
+    // by the helper (dictate --download), which reports its progress line by line; closing the window
+    // stops it (the next download continues where it stopped). Returns [group, a model is installed].
+    _modelGroup(window) {
+        const group = new Adw.PreferencesGroup({title: 'Speech Model',
+            description: 'NVIDIA Parakeet TDT 0.6B v3 (CC BY 4.0), downloaded from Hugging Face. ' +
+                'It runs on this computer, without network access.'});
+        let info = modelInfo();
+        if (!info) {
+            const row = new Adw.ActionRow({title: 'The Speech Engine Is Not Installed',
+                subtitle: 'Dictation needs the Dictator helper program, installed separately'});
+            row.add_suffix(new Gtk.LinkButton({label: 'How to Install', uri: `${REPO}#install`,
+                valign: Gtk.Align.CENTER}));
+            group.add(row);
+            return [group, false];
+        }
+        const toast = title => window.add_toast(new Adw.Toast({title, timeout: 5}));
+        const rows = new Map();
+        let job = null;             // {id, proc, pulse, cancelled}
+        let updating = false;
+
+        const refresh = () => {
+            info = modelInfo() ?? info;
+            updating = true;
+            for (const [id, u] of rows) {
+                const v = info.variants[id];
+                const running = job?.id === id;
+                u.radio.sensitive = v.installed;
+                u.radio.active = info.used === id;
+                u.download.visible = !v.installed && !running;
+                u.remove.visible = v.installed && !running;
+                u.download.sensitive = u.remove.sensitive = !job && !info.busy;
+                u.bar.visible = u.cancel.visible = running;
+                if (!running)
+                    u.row.subtitle = v.installed ? `${info.used === id ? 'In use' : 'Installed'}, ${gb(v.disk)}` : u.note(v);
+            }
+            updating = false;
+        };
+
+        const stopJob = () => {
+            if (job?.pulse)
+                GLib.source_remove(job.pulse);
+            if (job)
+                job.pulse = 0;
+        };
+
+        const download = id => {
+            const u = rows.get(id);
+            let proc;
+            try {
+                proc = Gio.Subprocess.new([HELPER, '--download', id],
+                    Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
+            } catch (e) {
+                toast(`Cannot start the download: ${e.message}`);
+                return;
+            }
+            job = {id, proc, pulse: 0, cancelled: false};
+            u.bar.fraction = 0;
+            u.row.subtitle = 'Starting…';
+            refresh();
+            let error = null;
+            const stream = new Gio.DataInputStream({base_stream: proc.get_stdout_pipe()});
+            const read = () => stream.read_line_async(GLib.PRIORITY_DEFAULT, null, (st, res) => {
+                let line = null;
+                try {
+                    [line] = st.read_line_finish_utf8(res);
+                } catch (e) {}
+                if (line === null)
+                    return;
+                const [kind, stage, done, total] = line.split(' ');
+                if (kind === 'E') {
+                    error = line.slice(2);
+                } else if (kind === 'P' && stage === 'download') {
+                    u.bar.fraction = Number(done) / Number(total);
+                    u.row.subtitle = `Downloading… ${gb(Number(done))} of ${gb(Number(total))}. Keep this window open`;
+                } else if (kind === 'P' && stage === 'convert' && done === '0' && !job.pulse) {
+                    u.row.subtitle = 'Converting to 8-bit on this computer…';
+                    job.pulse = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 150, () => {
+                        u.bar.pulse();
+                        return GLib.SOURCE_CONTINUE;
+                    });
+                }
+                read();
+            });
+            read();
+            proc.wait_async(null, (p, res) => {
+                try {
+                    p.wait_finish(res);
+                } catch (e) {}
+                stopJob();
+                const cancelled = job.cancelled;
+                job = null;
+                if (!cancelled)
+                    toast(error ?? (p.get_successful() ? 'The speech model is ready' : 'The download failed'));
+                refresh();
+            });
+        };
+
+        const remove = (id, title) => {
+            const dlg = new Adw.AlertDialog({heading: `Remove the ${title} Model?`,
+                body: `This frees ${gb(info.variants[id].disk)}. You can download it again later.`});
+            dlg.add_response('cancel', 'Cancel');
+            dlg.add_response('remove', 'Remove');
+            dlg.set_response_appearance('remove', Adw.ResponseAppearance.DESTRUCTIVE);
+            dlg.connect('response', (d, response) => {
+                if (response !== 'remove')
+                    return;
+                try {
+                    Gio.Subprocess.new([HELPER, '--remove', id], Gio.SubprocessFlags.STDERR_SILENCE).wait(null);
+                } catch (e) {
+                    toast(`Cannot remove it: ${e.message}`);
+                }
+                refresh();
+            });
+            dlg.present(window);
+        };
+
+        let first = null;
+        for (const v of VARIANTS) {
+            const row = new Adw.ActionRow({title: v.title});
+            const radio = new Gtk.CheckButton({valign: Gtk.Align.CENTER, group: first});
+            first ??= radio;
+            radio.connect('toggled', () => {
+                if (!updating && radio.active)
+                    writeSpeech({...readSpeech(), model: v.id});
+                if (!updating)
+                    refresh();
+            });
+            const dl = new Gtk.Button({label: 'Download', valign: Gtk.Align.CENTER});
+            dl.connect('clicked', () => download(v.id));
+            const rm = new Gtk.Button({icon_name: 'user-trash-symbolic', valign: Gtk.Align.CENTER,
+                tooltip_text: 'Remove', css_classes: ['flat']});
+            rm.connect('clicked', () => remove(v.id, v.title));
+            const bar = new Gtk.ProgressBar({valign: Gtk.Align.CENTER, width_request: 120});
+            const cancel = new Gtk.Button({label: 'Cancel', valign: Gtk.Align.CENTER});
+            cancel.connect('clicked', () => {
+                job.cancelled = true;
+                job.proc.send_signal(15);       // SIGTERM: the helper stops its download or conversion
+            });
+            row.add_prefix(radio);
+            for (const w of [bar, cancel, dl, rm])
+                row.add_suffix(w);
+            row.activatable_widget = radio;
+            group.add(row);
+            rows.set(v.id, {row, radio, download: dl, remove: rm, bar, cancel, note: v.note});
+        }
+        window.connect('close-request', () => {
+            if (job) {
+                job.cancelled = true;
+                job.proc.send_signal(15);
+            }
+            stopJob();
+            return false;
+        });
+        refresh();
+        if (info.busy)
+            group.description += '\nA download is running in another window.';
+        return [group, !!info.used];
     }
 
     _privacyGroup() {
