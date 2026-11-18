@@ -129,6 +129,11 @@ def privacy():
 #   model = int8|fp32       which model variant to use (if it is installed; else the other one)
 # ~/.config/dictate/replacements: "words = replacement" per line, applied to every text
 SPEECH_FILE = os.path.expanduser("~/.config/dictate/speech")
+# How much surer a candidate language must be on top of `margin`, by (candidate, main language): the
+# model leans to some languages. Measured on Ukrainian dictation (one speaker, laptop and headset):
+# decoded as Russian it scored up to +0.52/s better than as Ukrainian, so Russian needs that much more
+# before it replaces Ukrainian. Pairs not listed are not known to lean: margin alone.
+LANG_BIAS = {("ru", "uk"): 0.45}
 # voice_gate: sound this many dB below your own voice is muted before recognition
 GATE_DB = {"off": 0, "light": 25, "medium": 18, "strong": 12}
 REPLACE_FILE = os.path.expanduser("~/.config/dictate/replacements")
@@ -964,8 +969,8 @@ class Streamer:
         return text, note
 
     def choose(self, res, seconds):
-        """(text, log note): the main language unless another candidate is surer by more than margin
-        per second, summed over all pieces."""
+        """(text, log note): the main language unless another candidate is surer, per second summed
+        over all pieces, by more than margin plus the model's known lean to it (LANG_BIAS)."""
         if not res:
             return "", "no voice"
         main = res[0]["main"]
@@ -979,7 +984,7 @@ class Streamer:
             score = {c: sum(r["cands"][c][1] for r in res) for c in codes}
             best = max(codes, key=lambda c: score[c])
             diff = (score[best] - score[main]) / seconds
-            pick = best if diff > self.settings["margin"] else main
+            pick = best if diff > self.settings["margin"] + LANG_BIAS.get((best, main), 0.0) else main
             lnote = f"lang {pick} ({best}-{main} {diff:+.3f}/s)"
         return " ".join(t.strip() for t in texts[pick] if t and t.strip()), lnote
 

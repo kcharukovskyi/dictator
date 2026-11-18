@@ -12,6 +12,9 @@
 - Transcribe Again: with "Keep Audio to Transcribe Again" on (Settings, Privacy; off by default) the
   last three recordings stay in RAM, and the menu can transcribe one again, as it was or in a
   language you choose in Settings (`dictate --redo`). The new text replaces the old one and is copied.
+- Choosing between Cyrillic languages depends on the pair: Russian must be 0.45/s surer on top of
+  the margin before it replaces Ukrainian, because the model leans to Russian on Ukrainian speech
+  (measured up to +0.52/s). Other pairs use the margin alone.
 - Finish key: Shift+Caps Lock can finish a recording (the lock is not toggled), and pressing a start
   shortcut in the "Finish and Paste" dialog makes the start shortcut finish too.
 
