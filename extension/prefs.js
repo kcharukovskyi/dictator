@@ -11,7 +11,7 @@ import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk';
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 import {setReader, readKeys, writeKeys, readPrivacy, writePrivacy, readSpeech, writeSpeech, ensureReplacements, readPillSpot,
-    writePillSpot, againLanguages, prettyAccel, gnomeShortcuts, LANGUAGES, CAPS, NONE, SAME, SHIFT_CAPS,
+    writePillSpot, againLanguages, prettyAccel, gnomeShortcuts, NEWLINE_MARK, LANGUAGES, CAPS, NONE, SAME, SHIFT_CAPS,
     DEFAULTS} from './keys.js';
 
 const THREAD_CHOICES = [[0, 'Automatic'], [1, '1'], [2, '2'], [4, '4'], [6, '6'], [8, '8']];
@@ -397,9 +397,13 @@ export default class DictatorPrefs extends ExtensionPreferences {
             row.add_suffix(new Gtk.LinkButton({label: 'How to Install', uri: `${REPO}#install`,
                 valign: Gtk.Align.CENTER}));
             group.add(row);
+            // the command itself, to select and copy (the extension cannot install a program itself)
+            group.add(new Adw.ActionRow({title: 'In a Terminal', subtitle_selectable: true,
+                subtitle: esc(`git clone ${REPO}.git\ncd dictator && ./install.sh --no-extension`)}));
             return [group, false];
         }
         const toast = title => window.add_toast(new Adw.Toast({title: esc(title), timeout: 5}));
+        let trial = null;           // the Try Dictation row, shown once a model is installed
         const rows = new Map();
         let job = null;             // {id, proc, pulse, cancelled}
         let updating = false;
@@ -420,6 +424,7 @@ export default class DictatorPrefs extends ExtensionPreferences {
                     u.row.subtitle = v.installed ? `${info.used === id ? 'In use' : 'Installed'}, ${gb(v.disk)}` : u.note(v);
             }
             updating = false;
+            trial?.row.set_visible(!!info.used && !job);
         };
 
         const stopJob = () => {
@@ -529,18 +534,103 @@ export default class DictatorPrefs extends ExtensionPreferences {
             group.add(row);
             rows.set(v.id, {row, radio, download: dl, remove: rm, bar, cancel, note: v.note});
         }
+        trial = this._trialRow(window);
+        group.add(trial.row);
         window.connect('close-request', () => {
             if (job) {
                 job.cancelled = true;
                 job.proc.send_signal(15);
             }
             stopJob();
+            trial.cancel();
             return false;
         });
         refresh();
         if (info.busy)
             group.description += '\nA download is running in another window.';
         return [group, !!info.used];
+    }
+
+    // A test dictation (dictate --try): the voice level while you speak, then the text, here and
+    // nowhere else; nothing is kept. Returns {row, cancel()}.
+    _trialRow(window) {
+        const row = new Adw.ActionRow({title: 'Try Dictation',
+            subtitle: 'Say a sentence: the text appears here and is typed nowhere'});
+        const level = new Gtk.LevelBar({valign: Gtk.Align.CENTER, width_request: 96, visible: false});
+        const button = new Gtk.Button({label: 'Try', valign: Gtk.Align.CENTER});
+        row.add_suffix(level);
+        row.add_suffix(button);
+        let proc = null, stdin = null;
+        const send = cmd => {
+            try {
+                stdin?.write_all(new TextEncoder().encode(`${cmd}\n`), null);
+                stdin?.flush(null);
+            } catch (e) {}
+        };
+        button.connect('clicked', () => {
+            if (proc) {                 // the second click: finish
+                send('stop');
+                button.sensitive = false;
+                return;
+            }
+            try {
+                proc = Gio.Subprocess.new([HELPER, '--try'], Gio.SubprocessFlags.STDIN_PIPE |
+                    Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
+            } catch (e) {
+                row.subtitle = esc(`Cannot start: ${e.message}`);
+                return;
+            }
+            const mine = proc;
+            stdin = proc.get_stdin_pipe();
+            button.label = 'Stop';
+            level.value = 0;
+            level.visible = true;
+            row.subtitle = 'Listening… speak, then press Stop';
+            const stream = new Gio.DataInputStream({base_stream: proc.get_stdout_pipe()});
+            const read = () => stream.read_line_async(GLib.PRIORITY_DEFAULT, null, (st, res) => {
+                let line = null;
+                try {
+                    [line] = st.read_line_finish_utf8(res);
+                } catch (e) {}
+                if (line === null || proc !== mine)
+                    return;
+                if (line.startsWith('L ')) {
+                    level.value = Math.max(0, Math.min(1, parseFloat(line.slice(2)) || 0));
+                } else if (line === 'S') {
+                    level.visible = false;
+                    row.subtitle = 'Transcribing…';
+                } else if (line.startsWith('T ')) {
+                    let text = '';
+                    try {
+                        text = JSON.parse(line.slice(2)).replaceAll(NEWLINE_MARK, ' ');
+                    } catch (e) {}
+                    row.subtitle = esc(text ? `“${text}”` : 'No speech recognised');
+                } else if (line.startsWith('E ')) {
+                    row.subtitle = esc(line.slice(2));
+                }
+                read();
+            });
+            read();
+            proc.wait_async(null, () => {
+                if (proc !== mine)
+                    return;
+                proc = stdin = null;
+                level.visible = false;
+                button.label = 'Try';
+                button.sensitive = true;
+            });
+        });
+        const cancel = () => {
+            if (!proc)
+                return;
+            send('cancel');             // the helper stops the microphone and the model, and exits
+            try {
+                stdin?.close(null);
+            } catch (e) {}
+            proc = stdin = null;
+        };
+        window.connect('unmap', cancel);
+        return {row, cancel};
     }
 
     _privacyGroup() {

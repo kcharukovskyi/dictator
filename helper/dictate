@@ -25,6 +25,8 @@ Other commands:
     dictate --download int8|fp32   download a model variant from Hugging Face (pinned revision, every
                                    file checked against its SHA-256); the only network access
     dictate --remove int8|fp32     delete a model variant
+    dictate --try                  a test dictation (the settings window): like a recording, but
+                                   nothing is kept, neither the audio nor the text
     dictate --selftest             load the model once and check that its sandbox has no network
     dictate --redo STAMP [LANG]    transcribe a recording from the history again (its audio is kept only
                                    with keep_audio on), as LANG or with the usual languages; prints S, then
@@ -1409,7 +1411,9 @@ def model_command(cmd, variant):
         sys.exit(1)
 
 
-def main():
+def main(trial=False):
+    """One dictation. trial (dictate --try, the settings window's test): nothing is kept, neither the
+    recording nor its text."""
     cleanup_old()
     path = None
     rec = Recognizer()
@@ -1431,21 +1435,23 @@ def main():
             raise Fail("Too short")
         wav = to_wav(raw)
         del raw
-        path = keep(wav)
+        path = None if trial else keep(wav)
         out("S")
         text = transcribe(wav, seconds, rec=rec, streamer=streamer)
         rec.close()
         if not text:
-            os.unlink(path)
+            if path:
+                os.unlink(path)
             path = None
             raise Fail("No speech recognised")
         out("T " + json.dumps(text, ensure_ascii=False))
-        try:
-            if privacy()["history"]:
-                remember(path, text, seconds)
-        except OSError as e:
-            log(f"history: {e}")
-        discard(path)                                     # the audio is never kept after its text
+        if path:
+            try:
+                if privacy()["history"]:
+                    remember(path, text, seconds)
+            except OSError as e:
+                log(f"history: {e}")
+            discard(path)                                 # the audio is never kept after its text
         path = None
     except Fail as e:
         if path and str(e) == "No speech recognised":      # silence: nothing worth keeping
@@ -1561,6 +1567,8 @@ if __name__ == "__main__":
         selftest()
     elif sys.argv[1:] == ["--retry"]:
         retry()
+    elif sys.argv[1:] == ["--try"]:
+        main(trial=True)
     elif sys.argv[1:2] == ["--redo"] and len(sys.argv) in (3, 4):
         redo(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else None)
     elif sys.argv[1:] == ["--models"]:
