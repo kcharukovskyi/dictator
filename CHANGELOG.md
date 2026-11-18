@@ -9,6 +9,9 @@
   recording. Retry uses the same pieces.
 - The recording indicator can be dragged with the mouse. Its place is remembered
   (`~/.config/dictate/pill`); a double-click, or choosing a position in Settings, puts it back.
+- Transcribe Again: with "Keep Audio to Transcribe Again" on (Settings, Privacy; off by default) the
+  last three recordings stay in RAM, and the menu can transcribe one again, as it was or in a
+  language you choose in Settings (`dictate --redo`). The new text replaces the old one and is copied.
 - Finish key: Shift+Caps Lock can finish a recording (the lock is not toggled), and pressing a start
   shortcut in the "Finish and Paste" dialog makes the start shortcut finish too.
 

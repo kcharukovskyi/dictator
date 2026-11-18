@@ -26,6 +26,9 @@ Other commands:
                                    file checked against its SHA-256); the only network access
     dictate --remove int8|fp32     delete a model variant
     dictate --selftest             load the model once and check that its sandbox has no network
+    dictate --redo STAMP [LANG]    transcribe a recording from the history again (its audio is kept only
+                                   with keep_audio on), as LANG or with the usual languages; prints S, then
+                                   T or E, and the new text replaces the old one in the history
 
 Where the model runs: ~/.config/dictate/runtime holds "host" (system Python with onnxruntime + numpy,
 in bubblewrap) or "podman" / "docker" (the offline "dictate-asr" image built from Containerfile).
@@ -88,18 +91,21 @@ HISTORY_N = 3
 # ~/.config/dictate/privacy (written by the settings window, format: extension/keys.js):
 #   history = on|off       keep the last HISTORY_N recordings for the top-bar menu
 #   keep_minutes = N       delete kept recordings (history and failed ones) after N minutes; 0 = until restart
+#   keep_audio = on|off    the history keeps the audio too (RAM only), so a text can be transcribed again
 PRIVACY_FILE = os.path.expanduser("~/.config/dictate/privacy")
 MAX_TEXT = 50000                       # 15 min of speech is ~20 000 characters
 
 
 def privacy():
-    p = {"history": True, "keep_minutes": 60}
+    p = {"history": True, "keep_minutes": 60, "keep_audio": False}
     try:
         with open(PRIVACY_FILE) as f:
             for line in f:
-                m = re.fullmatch(r"\s*(history|keep_minutes)\s*=\s*(\S+)\s*", line)
+                m = re.fullmatch(r"\s*(history|keep_minutes|keep_audio)\s*=\s*(\S+)\s*", line)
                 if m and m[1] == "history":
                     p["history"] = m[2] != "off"
+                elif m and m[1] == "keep_audio":
+                    p["keep_audio"] = m[2] == "on"
                 elif m and m[2].isdigit():
                     p["keep_minutes"] = int(m[2])
     except OSError:
@@ -1045,21 +1051,23 @@ def wav_pcm(wav):
         return w.readframes(w.getnframes())
 
 
-def transcribe(wav, seconds, rec=None, streamer=None):
+def transcribe(wav, seconds, rec=None, streamer=None, settings=None):
     """The text of a whole recording. streamer: the one that got the audio while it was recorded
-    (most pieces are done by now); without it the recording is cut into the same pieces here."""
+    (most pieces are done by now); without it the recording is cut into the same pieces here.
+    settings: speech settings to use instead of the saved ones (a chosen language)."""
     own = rec is None
     rec = rec or Recognizer()
+    settings = settings or speech()
     try:
         raw = wav_pcm(wav)
         if streamer is None:
-            streamer = Streamer(rec)
+            streamer = Streamer(rec, settings)
             streamer.feed(raw)
         text, note = streamer.finish(raw)
     finally:
         if own:
             rec.close()
-    text = polish(text)
+    text = polish(text, settings)
     engine = f", {rec.variant} via {rec.via}, load {rec.ready}s (waited {rec.waited:.1f}s)" if rec.via else ""
     log(f"ok local, {seconds:.1f}s audio, {len(text)} chars, {note}{engine}")
     return text
@@ -1087,31 +1095,37 @@ def cleanup_old():
             continue
         for name in names:
             path = os.path.join(d, name)
+            audio_off = d == HISTORY_DIR and name.endswith(".wav") and not p["keep_audio"]
             try:
-                if everything or (keep_s and time.time() - os.path.getmtime(path) > keep_s):
+                if everything or audio_off or (keep_s and time.time() - os.path.getmtime(path) > keep_s):
                     os.unlink(path)
             except OSError:
                 pass
 
 
 def remember(path, text, seconds):
-    """Keep the text (not the audio) in the history (RAM) for the extension's menu; only the newest
-    HISTORY_N stay."""
+    """Keep the text in the history (RAM) for the extension's menu, and the audio too if keep_audio is
+    on (else it is deleted); only the newest HISTORY_N stay."""
     os.makedirs(HISTORY_DIR, mode=0o700, exist_ok=True)
     stamp = os.path.basename(path)[:-4]
-    meta = {"time": int(os.path.getmtime(path)), "seconds": round(seconds, 1), "text": text}
+    save_meta(stamp, {"time": int(os.path.getmtime(path)), "seconds": round(seconds, 1), "text": text})
+    if privacy()["keep_audio"]:
+        os.replace(path, os.path.join(HISTORY_DIR, stamp + ".wav"))
+    else:
+        os.unlink(path)
+    stamps = sorted(n[:-5] for n in os.listdir(HISTORY_DIR) if n.endswith(".json"))
+    for old in stamps[:-HISTORY_N]:
+        for ext in (".json", ".wav"):
+            discard(os.path.join(HISTORY_DIR, old + ext))
+
+
+def save_meta(stamp, meta):
+    """Write a history entry's text and numbers, atomically (the extension may read it meanwhile)."""
     tmp = os.path.join(HISTORY_DIR, f".{stamp}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(meta, f, ensure_ascii=False)
     os.replace(tmp, os.path.join(HISTORY_DIR, stamp + ".json"))
-    os.unlink(path)
-    stamps = sorted(n[:-5] for n in os.listdir(HISTORY_DIR) if n.endswith(".json"))
-    for old in stamps[:-HISTORY_N]:
-        try:
-            os.unlink(os.path.join(HISTORY_DIR, old + ".json"))
-        except FileNotFoundError:
-            pass
 
 
 def discard(path):
@@ -1479,6 +1493,38 @@ def retry():
         rec.close()
 
 
+def redo(stamp, lang=None):
+    """`dictate --redo`: transcribe a history recording again, as `lang` (only that language's letters,
+    plus plain Latin) or with the saved languages. The new text replaces the old one in the history."""
+    cleanup_old()
+    try:
+        if not re.fullmatch(r"rec-\d{8}-\d{6}", stamp) or lang not in (None, *LANGS):
+            raise Fail("Bad request")
+        try:
+            with open(os.path.join(HISTORY_DIR, stamp + ".wav"), "rb") as f:
+                wav = f.read()
+            with open(os.path.join(HISTORY_DIR, stamp + ".json")) as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            raise Fail("That recording is gone") from None
+        if not isinstance(meta, dict):
+            raise Fail("That recording is gone")
+        out("S")
+        settings = speech()
+        if lang:
+            settings["languages"] = [lang]
+        text = transcribe(wav, (len(wav) - 44) / 2 / RATE, settings=settings)
+        if not text:
+            raise Fail("No speech recognised")
+        save_meta(stamp, {**meta, "text": text})
+        out("T " + json.dumps(text, ensure_ascii=False))
+    except Fail as e:
+        out(f"E {e}")
+    except Exception as e:                                # never leave the overlay hanging
+        log(f"redo crash: {type(e).__name__}: {e}")
+        out(f"E {type(e).__name__}")
+
+
 def selftest():
     """Starts the model and transcribes 1 s of silence: checks the runtime and the model files."""
     t0 = time.monotonic()
@@ -1510,6 +1556,8 @@ if __name__ == "__main__":
         selftest()
     elif sys.argv[1:] == ["--retry"]:
         retry()
+    elif sys.argv[1:2] == ["--redo"] and len(sys.argv) in (3, 4):
+        redo(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else None)
     elif sys.argv[1:] == ["--models"]:
         models()
     elif sys.argv[1:2] in (["--download"], ["--remove"]) and len(sys.argv) == 3:

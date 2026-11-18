@@ -4,7 +4,7 @@
 // them too: that is why they are plain files and not GSettings. Written by the settings window
 // (prefs.js), read by the extension. Imports only GLib / Gio: prefs.js runs outside GNOME Shell.
 //   keys          shortcuts, "name = GNOME accelerator" (see HEADER)
-//   privacy       history = on|off, keep_minutes = N, clipboard = on|off
+//   privacy       history = on|off, keep_minutes = N, clipboard = on|off, keep_audio = on|off, again = codes
 //   speech        languages, text options, microphone, model... (see writeSpeech)
 //   replacements  "what you say = what is typed", one per line
 //   pill          where you dragged the recording indicator (see readPillSpot)
@@ -119,20 +119,33 @@ export function takenBy(accel, list = gnomeShortcuts()) {
 }
 
 export const PRIVACY_FILE = GLib.build_filenamev([DIR, 'privacy']);
-export const PRIVACY_DEFAULTS = Object.freeze({history: true, keepMinutes: 60, clipboard: false});
+// again: the languages offered by "Transcribe Again" in the menu; null = the enabled languages
+export const PRIVACY_DEFAULTS = Object.freeze({history: true, keepMinutes: 60, clipboard: false, keepAudio: false,
+    again: null});
 
 export function readPrivacy() {
     const p = {...PRIVACY_DEFAULTS};
+    const codes = new Set(LANGUAGES.map(([c]) => c));
     for (const line of (load(PRIVACY_FILE) ?? '').split('\n')) {
-        const m = line.trim().match(/^(history|keep_minutes|clipboard)\s*=\s*(\S+)$/);
+        const m = line.trim().match(/^(history|keep_minutes|clipboard|keep_audio|again)\s*=\s*(.*)$/);
+        const v = m?.[2].trim();
         if (m?.[1] === 'history')
-            p.history = m[2] !== 'off';
+            p.history = v !== 'off';
         else if (m?.[1] === 'clipboard')
-            p.clipboard = m[2] === 'on';
-        else if (m && /^\d+$/.test(m[2]))
-            p.keepMinutes = parseInt(m[2]);
+            p.clipboard = v === 'on';
+        else if (m?.[1] === 'keep_audio')
+            p.keepAudio = v === 'on';
+        else if (m?.[1] === 'again')
+            p.again = [...new Set(v.split(/[\s,]+/).filter(c => codes.has(c)))];
+        else if (m && /^\d+$/.test(v))
+            p.keepMinutes = parseInt(v);
     }
     return p;
+}
+
+// the languages "Transcribe Again" offers: chosen in Settings, else the enabled ones
+export function againLanguages(p = readPrivacy()) {
+    return p.again ?? readSpeech().languages;
 }
 
 export function writePrivacy(p) {
@@ -143,8 +156,11 @@ export function writePrivacy(p) {
         '# keep_minutes = N: delete kept recordings (also failed ones) after N minutes; 0 = until restart\n' +
         '# clipboard = on|off: apps that cannot take typed text get it by a paste through the clipboard;\n' +
         '#   off: the clipboard is never used, the text waits in the microphone menu\n' +
+        '# keep_audio = on|off: the history keeps the audio too (RAM only), for "Transcribe Again"\n' +
+        '# again = codes: the languages "Transcribe Again" offers (no line: the enabled languages)\n' +
         `history = ${p.history ? 'on' : 'off'}\nkeep_minutes = ${p.keepMinutes}\n` +
-        `clipboard = ${p.clipboard ? 'on' : 'off'}\n`);
+        `clipboard = ${p.clipboard ? 'on' : 'off'}\nkeep_audio = ${p.keepAudio ? 'on' : 'off'}\n` +
+        (p.again ? `again = ${p.again.join(' ')}\n` : ''));
 }
 
 // Speech settings; the helper reads all but space_after and pill.

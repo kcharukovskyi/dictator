@@ -23,8 +23,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as Keyboard from 'resource:///org/gnome/shell/ui/status/keyboard.js';
-import {readKeys, readPrivacy, readSpeech, readPillSpot, writePillSpot, cleanText, CAPS, NONE, SAME, SHIFT_CAPS,
-    NEWLINE_MARK} from './keys.js';
+import {readKeys, readPrivacy, readSpeech, readPillSpot, writePillSpot, againLanguages, cleanText, CAPS, NONE, SAME,
+    SHIFT_CAPS, NEWLINE_MARK, LANGUAGES} from './keys.js';
 
 const HELPER = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'dictate']);
 const PENDING_DIR = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'dictate']);
@@ -133,8 +133,8 @@ export class Core {
         this._pill = null;
         this._indicator?.destroy();
         this._indicator = null;
-        this._retryProc?.force_exit();
-        this._retryProc = null;
+        this._sideProc?.force_exit();
+        this._sideProc = null;
         if (this._expireId)
             GLib.source_remove(this._expireId);
         this._expireId = 0;
@@ -181,10 +181,10 @@ export class Core {
         this._capsBefore = null;
     }
 
-    // delete kept recordings older than the privacy setting, and the whole history when it is off
-    // (the helper does it too, but only when it runs)
+    // delete kept recordings older than the privacy setting, the whole history when it is off, and its
+    // audio when "Keep Audio" is off (the helper does it too, but only when it runs)
     _expire() {
-        const {history, keepMinutes} = readPrivacy();
+        const {history, keepMinutes, keepAudio} = readPrivacy();
         const now = GLib.get_real_time() / 1e6;
         this._unsent = (this._unsent ?? []).filter(u => !keepMinutes || now - u.time <= keepMinutes * 60);
         for (const [dir, everything] of [[PENDING_DIR, false], [HISTORY_DIR, !history]]) {
@@ -203,7 +203,8 @@ export class Core {
                 try {
                     const mtime = f.query_info('time::modified', Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
                         .get_modification_date_time().to_unix();
-                    if (everything || (keepMinutes && now - mtime > keepMinutes * 60))
+                    const audioOff = dir === HISTORY_DIR && !keepAudio && name.endsWith('.wav');
+                    if (everything || audioOff || (keepMinutes && now - mtime > keepMinutes * 60))
                         f.delete(null);
                 } catch (e) {}
             }
@@ -361,7 +362,7 @@ export class Core {
         if (this._lockedTexts) {
             this._lockedTexts = 0;
             this._show('done', 'The screen was locked: the text is in the microphone menu', 5000);
-        } else if (this._state === 'busy' || this._retryProc) {
+        } else if (this._state === 'busy' || this._sideProc) {
             this._show('busy', 'Transcribing…');
         }
     }
@@ -842,7 +843,9 @@ export class Core {
             try {
                 const [, b] = GLib.file_get_contents(`${HISTORY_DIR}/${name}`);
                 const h = JSON.parse(new TextDecoder().decode(b));
-                list.push({stamp: name.slice(0, -5), time: Number(h.time) || 0, text: cleanText(h.text)});
+                const stamp = name.slice(0, -5);
+                list.push({stamp, time: Number(h.time) || 0, text: cleanText(h.text),
+                    audio: GLib.file_test(`${HISTORY_DIR}/${stamp}.wav`, GLib.FileTest.IS_REGULAR)});
             } catch (e) {}
         }
         dir.close();
@@ -862,12 +865,13 @@ export class Core {
     }
 
     // The menu, kept minimal (GNOME HIG): the last 3 texts (click: copy it), failed recordings when
-    // there are any, and Settings. Nothing else.
+    // there are any, and Settings. With "Keep Audio" on (Settings, Privacy) a text opens a submenu
+    // instead: copy it, or transcribe its recording again, as it was or in one of the chosen languages.
     _fillMenu() {
         const sec = this._section;
         sec.removeAll();
         this._expire();
-        const busy = !!this._state || !!this._retryProc;
+        const busy = !!this._state || !!this._sideProc;
         const privacy = readPrivacy();
         const list = [...(privacy.history ? this._history() : []), ...this._unsent]
             .filter(h => h.text).sort((a, b) => b.time - a.time).slice(0, HISTORY_N);
@@ -877,15 +881,29 @@ export class Core {
             empty.label.add_style_class_name('dictation-menu-dim');
             sec.addMenuItem(empty);
         }
+        const names = new Map(LANGUAGES.map(([c, en]) => [c, en]));
+        const again = privacy.keepAudio ? againLanguages(privacy) : [];
         for (const h of list) {
-            const item = new PopupMenu.PopupMenuItem(h.text.replaceAll(NEWLINE_MARK, ' '));
+            const redo = privacy.keepAudio && h.audio;
+            const item = redo ? new PopupMenu.PopupSubMenuMenuItem(h.text.replaceAll(NEWLINE_MARK, ' '))
+                : new PopupMenu.PopupMenuItem(h.text.replaceAll(NEWLINE_MARK, ' '));
             item.label.add_style_class_name('dictation-menu-text');
             item.label.clutter_text.ellipsize = Pango.EllipsizeMode.END;
             item.label.x_expand = true;
-            item.add_child(new St.Label({style_class: 'dictation-menu-dim dictation-menu-time',
+            const time = new St.Label({style_class: 'dictation-menu-dim dictation-menu-time',
                 text: GLib.DateTime.new_from_unix_local(h.time).format('%H:%M'),
-                y_align: Clutter.ActorAlign.CENTER}));
-            item.connect('activate', () => this._copy(h.text));
+                y_align: Clutter.ActorAlign.CENTER});
+            if (redo) {         // the time before the submenu arrow
+                item.insert_child_below(time, item.get_children().at(-1));
+                item.menu.addAction('Copy', () => this._copy(h.text));
+                for (const lang of [null, ...again]) {
+                    const label = lang ? `Again in ${names.get(lang) ?? lang}` : 'Transcribe Again';
+                    item.menu.addAction(label, () => this._redo(h.stamp, lang)).setSensitive(!busy);
+                }
+            } else {
+                item.add_child(time);
+                item.connect('activate', () => this._copy(h.text));
+            }
             sec.addMenuItem(item);
         }
         const failed = this._failedCount();
@@ -920,11 +938,37 @@ export class Core {
 
     // transcribe the failed recordings again; the texts go to the menu
     _retry() {
-        if (this._state || this._retryProc || !this._helperThere())
+        this._runSide(['--retry'], (texts, err) => {
+            texts.forEach(t => this._keep(t));
+            if (texts.length)
+                this._show('done', `Recovered: the text is in the microphone menu${err ? ` (${err})` : ''}`, 4000);
+            else
+                this._show('error', err ?? 'No speech recognised', 3500);
+        });
+    }
+
+    // transcribe a recording from the history again (lang: a language code, or null for the usual ones);
+    // the helper puts the new text into the history, and it is copied, like a click on a text
+    _redo(stamp, lang) {
+        this._runSide(['--redo', stamp, ...(lang ? [lang] : [])], (texts, err) => {
+            if (texts.length) {
+                this._setClipboard(texts[0].replaceAll(NEWLINE_MARK, '\n'));
+                this._show('done', 'New text copied', 2500);
+            } else {
+                this._show('error', err ?? 'No speech recognised', 3500);
+            }
+        });
+    }
+
+    // Run the helper for work outside a recording (one at a time, never during one), with the
+    // "Transcribing again" pill. done(texts, error) gets the helper's T and E lines, unless a new
+    // recording started meanwhile (its pill is not touched then; texts of a retry are kept anyway).
+    _runSide(args, done) {
+        if (this._state || this._sideProc || !this._helperThere())
             return;
         let proc;
         try {
-            proc = this._retryProc = Gio.Subprocess.new([HELPER, '--retry'], Gio.SubprocessFlags.STDOUT_PIPE);
+            proc = this._sideProc = Gio.Subprocess.new([HELPER, ...args], Gio.SubprocessFlags.STDOUT_PIPE);
         } catch (e) {
             this._show('error', `Cannot start dictation: ${e.message}`, 4000);
             return;
@@ -932,9 +976,9 @@ export class Core {
         this._pickMonitor();
         this._show('busy', 'Transcribing again…');
         proc.communicate_utf8_async(null, null, (p, res) => {
-            if (p !== this._retryProc)
+            if (p !== this._sideProc)
                 return;
-            this._retryProc = null;
+            this._sideProc = null;
             let out = '';
             try {
                 [, out] = p.communicate_utf8_finish(res);
@@ -948,13 +992,12 @@ export class Core {
                 }
             }).filter(Boolean);
             const err = lines.find(l => l.startsWith('E '))?.slice(2);
-            texts.forEach(t => this._keep(t));
-            if (this._state)            // a new recording started meanwhile: do not touch its pill
+            if (this._state) {          // a new recording started meanwhile: do not touch its pill
+                if (args[0] === '--retry')
+                    texts.forEach(t => this._keep(t));
                 return;
-            if (texts.length)
-                this._show('done', `Recovered: the text is in the microphone menu${err ? ` (${err})` : ''}`, 4000);
-            else
-                this._show('error', err ?? 'No speech recognised', 3500);
+            }
+            done(texts, err);
         });
     }
 

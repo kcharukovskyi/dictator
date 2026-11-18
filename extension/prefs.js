@@ -11,7 +11,8 @@ import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk';
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 import {readKeys, writeKeys, readPrivacy, writePrivacy, readSpeech, writeSpeech, ensureReplacements, readPillSpot,
-    writePillSpot, prettyAccel, gnomeShortcuts, LANGUAGES, CAPS, NONE, SAME, SHIFT_CAPS, DEFAULTS} from './keys.js';
+    writePillSpot, againLanguages, prettyAccel, gnomeShortcuts, LANGUAGES, CAPS, NONE, SAME, SHIFT_CAPS,
+    DEFAULTS} from './keys.js';
 
 const THREAD_CHOICES = [[0, 'Automatic'], [1, '1'], [2, '2'], [4, '4'], [6, '6'], [8, '8']];
 const STOP_CHOICES = [[0, 'Off'], [2, 'After 2 seconds'], [3, 'After 3 seconds'], [5, 'After 5 seconds'],
@@ -550,16 +551,44 @@ export default class DictatorPrefs extends ExtensionPreferences {
             keep.model.append(`${p.keepMinutes} minutes`);
             keep.selected = KEEP_CHOICES.length;
         }
+        const audio = new Adw.SwitchRow({title: 'Keep Audio to Transcribe Again',
+            subtitle: 'The recordings of those texts stay in memory too, so the menu can transcribe them ' +
+                'again, also in another language',
+            active: p.keepAudio});
+        // the languages the menu offers; until you change them, the enabled ones (saved only once changed)
+        const again = new Adw.ExpanderRow({title: 'Transcribe Again In'});
+        let chosen = againLanguages(p), touched = p.again !== null;
+        const summary = () => {
+            again.subtitle = chosen.length ? LANGUAGES.filter(([c]) => chosen.includes(c)).map(([, en]) => en)
+                .join(', ') : 'Only as it was';
+        };
+        for (const [code, en, own] of LANGUAGES) {
+            const row = new Adw.SwitchRow({title: en === own ? en : `${en} (${own})`, active: chosen.includes(code)});
+            row.connect('notify::active', () => {
+                chosen = row.active ? [...new Set([...chosen, code])] : chosen.filter(c => c !== code);
+                touched = true;
+                summary();
+                save();
+            });
+            again.add_row(row);
+        }
+        summary();
+        const sync = () => {
+            audio.sensitive = history.active;
+            again.sensitive = history.active && audio.active;
+        };
         const save = () => {
             const minutes = KEEP_CHOICES[keep.selected]?.[0] ?? readPrivacy().keepMinutes;
-            writePrivacy({history: history.active, keepMinutes: minutes, clipboard: clipboard.active});
+            writePrivacy({history: history.active, keepMinutes: minutes, clipboard: clipboard.active,
+                keepAudio: audio.active, again: touched ? chosen : null});
+            sync();
         };
-        history.connect('notify::active', save);
-        clipboard.connect('notify::active', save);
+        for (const w of [history, clipboard, audio])
+            w.connect('notify::active', save);
         keep.connect('notify::selected', save);
-        group.add(clipboard);
-        group.add(history);
-        group.add(keep);
+        sync();
+        for (const w of [clipboard, history, audio, again, keep])
+            group.add(w);
         return group;
     }
 

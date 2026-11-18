@@ -111,6 +111,9 @@ GNOME already owns (for example, Super+Space switches the input source).
   stays there so that you can retry it from the menu. All recordings are deleted after the time set in
   Settings (1 hour by default).
 - The menu keeps your last three texts in RAM. You can turn this off.
+- Only if you turn on **Keep Audio to Transcribe Again** (Settings, Privacy), their recordings stay in
+  RAM too, for the same time, so the menu can transcribe a text again: as it was, or in one of the
+  languages you choose there. Off by default; turning it off deletes the kept audio.
 - The log (`~/.cache/dictate/dictate.log`) contains timings and numbers, never your text.
 - No telemetry.
 
