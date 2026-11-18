@@ -4,8 +4,10 @@
 """Dictator helper: records the microphone and turns speech into text on this computer.
 
 Started by the Dictator GNOME extension for each recording. It records with pw-record until it gets
-"stop" or "cancel" on stdin ("pause" / "resume": the paused stretch is cut out), then runs the speech
-model (NVIDIA Parakeet TDT 0.6B v3, parakeet.py) in a sandbox without network and prints the text.
+"stop" or "cancel" on stdin ("pause" / "resume": the paused stretch is cut out) and turns it into text
+with the speech model (NVIDIA Parakeet TDT 0.6B v3, parakeet.py) in a sandbox without network. The
+recording is transcribed in pieces cut at your pauses WHILE you speak (class Streamer), so the text
+is there about a second after you stop, however long you spoke.
 Protocol on stdout, one line each:
     L <0..1>      voice level, ~20 per second while recording
     S             recording finished, transcribing
@@ -24,6 +26,9 @@ Other commands:
                                    file checked against its SHA-256); the only network access
     dictate --remove int8|fp32     delete a model variant
     dictate --selftest             load the model once and check that its sandbox has no network
+    dictate --redo STAMP [LANG]    transcribe a recording from the history again (its audio is kept only
+                                   with keep_audio on), as LANG or with the usual languages; prints S, then
+                                   T or E, and the new text replaces the old one in the history
 
 Where the model runs: ~/.config/dictate/runtime holds "host" (system Python with onnxruntime + numpy,
 in bubblewrap) or "podman" / "docker" (the offline "dictate-asr" image built from Containerfile).
@@ -86,18 +91,21 @@ HISTORY_N = 3
 # ~/.config/dictate/privacy (written by the settings window, format: extension/keys.js):
 #   history = on|off       keep the last HISTORY_N recordings for the top-bar menu
 #   keep_minutes = N       delete kept recordings (history and failed ones) after N minutes; 0 = until restart
+#   keep_audio = on|off    the history keeps the audio too (RAM only), so a text can be transcribed again
 PRIVACY_FILE = os.path.expanduser("~/.config/dictate/privacy")
 MAX_TEXT = 50000                       # 15 min of speech is ~20 000 characters
 
 
 def privacy():
-    p = {"history": True, "keep_minutes": 60}
+    p = {"history": True, "keep_minutes": 60, "keep_audio": False}
     try:
         with open(PRIVACY_FILE) as f:
             for line in f:
-                m = re.fullmatch(r"\s*(history|keep_minutes)\s*=\s*(\S+)\s*", line)
+                m = re.fullmatch(r"\s*(history|keep_minutes|keep_audio)\s*=\s*(\S+)\s*", line)
                 if m and m[1] == "history":
                     p["history"] = m[2] != "off"
+                elif m and m[1] == "keep_audio":
+                    p["keep_audio"] = m[2] == "on"
                 elif m and m[2].isdigit():
                     p["keep_minutes"] = int(m[2])
     except OSError:
@@ -121,6 +129,11 @@ def privacy():
 #   model = int8|fp32       which model variant to use (if it is installed; else the other one)
 # ~/.config/dictate/replacements: "words = replacement" per line, applied to every text
 SPEECH_FILE = os.path.expanduser("~/.config/dictate/speech")
+# How much surer a candidate language must be on top of `margin`, by (candidate, main language): the
+# model leans to some languages. Measured on Ukrainian dictation (one speaker, laptop and headset):
+# decoded as Russian it scored up to +0.52/s better than as Ukrainian, so Russian needs that much more
+# before it replaces Ukrainian. Pairs not listed are not known to lean: margin alone.
+LANG_BIAS = {("ru", "uk"): 0.45}
 # voice_gate: sound this many dB below your own voice is muted before recognition
 GATE_DB = {"off": 0, "light": 25, "medium": 18, "strong": 12}
 REPLACE_FILE = os.path.expanduser("~/.config/dictate/replacements")
@@ -349,8 +362,10 @@ def cut(raw, spans):
     return bytes(keep)
 
 
-def record():
+def record(streamer=None):
     """Returns raw s16 mono audio, or None when cancelled.
+    streamer: gets the audio while it is recorded (exactly the bytes that will be returned, paused
+    stretches cut out), so it can transcribe pieces in the background; finish() checks it got them.
     Pause: the microphones keep running (no headset re-switch, no gap in time), the paused stretches
     are remembered as byte positions and cut out at the end.
     Bluetooth headset: recording makes WirePlumber switch it from music mode (A2DP) to headset mode
@@ -387,6 +402,34 @@ def record():
     spans_main, spans_early = [], []                 # paused byte spans in audio / in early
     paused_s, paused_at = 0.0, 0.0
     voice = {"chunks": 0, "at": time.monotonic()}  # voiced 50 ms chunks so far, when voice was last heard
+    fed = 0                                          # position in audio up to which the streamer has it
+    head = b""                                       # built-in mic audio before `live` (headset case)
+
+    def src(a, b):
+        """audio[a:b] as it will be returned: the built-in mic before `live`, the main mic after"""
+        if a >= live:
+            return audio[a:b]
+        return head[a:min(b, live)] + audio[max(a, live):b]
+
+    def feed():
+        """Give the streamer what is new, with the same cuts as cut(). Only once it is known which
+        microphone the start comes from (a headset mic that is not live yet: wait)."""
+        nonlocal fed
+        if streamer is None or live is None:
+            return
+        end, pos = len(audio), fed
+        for a, b in spans_main + ([(paused[0], None)] if paused is not None else []):
+            a, b = a & ~1, end if b is None else b & ~1
+            if b <= pos:
+                continue
+            if a >= end:
+                break
+            if a > pos:
+                streamer.feed(src(pos, a))
+            pos = max(pos, b)
+        if pos < end:
+            streamer.feed(src(pos, end))
+        fed = max(pos, end)
 
     def level(v):
         out(f"L {v:.3f}")
@@ -462,9 +505,12 @@ def record():
                                 pass
                             stop_proc(bridge)
                             bridge = None
+                            head = bytes(early[:live])
+                            head += bytes(audio[len(head):live])   # built-in mic started late: zeros
                         audio += chunk
                         if live is not None and paused is None:
                             level(meter.level(chunk))
+                    feed()
     except StopIteration:
         pass
     finally:
@@ -494,6 +540,43 @@ def record():
     return cut(bytes(head + audio[live:]), spans_main)
 
 
+class VoiceBand:
+    """Mean power of s16 audio in the voice band only (120 Hz high-pass, then 2200 Hz low-pass; this
+    also removes DC). Laptop microphones often have a constant DC offset and strong rumble below 80 Hz,
+    20+ dB louder than speech; measured in full band every frame looks alike. Keeps its state across
+    calls, so the audio must come in order."""
+
+    def __init__(self):
+        self.bq = [self._biquad(120, "hp"), self._biquad(2200, "lp")]
+
+    def power(self, a):
+        """a: array("h"). Returns the mean square of the filtered samples (s16 units)."""
+        acc = 0.0
+        (b0, b1, b2, a1, a2, s1), (c0, c1, c2, d1, d2, s2) = self.bq
+        x1, x2, y1, y2 = s1
+        u1, u2, z1, z2 = s2
+        for x in a:
+            y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+            x2, x1, y2, y1 = x1, x, y1, y
+            z = c0 * y + c1 * u1 + c2 * u2 - d1 * z1 - d2 * z2
+            u2, u1, z2, z1 = u1, y, z1, z
+            acc += z * z
+        s1[:] = [x1, x2, y1, y2]
+        s2[:] = [u1, u2, z1, z2]
+        return acc / (len(a) or 1)
+
+    @staticmethod
+    def _biquad(f0, kind, q=0.7071):
+        w = 2 * math.pi * f0 / RATE
+        al, cw = math.sin(w) / (2 * q), math.cos(w)
+        if kind == "hp":
+            b = [(1 + cw) / 2, -(1 + cw), (1 + cw) / 2]
+        else:
+            b = [(1 - cw) / 2, 1 - cw, (1 - cw) / 2]
+        a0 = 1 + al
+        return (b[0] / a0, b[1] / a0, b[2] / a0, -2 * cw / a0, (1 - al) / a0, [0.0, 0.0, 0.0, 0.0])
+
+
 class Meter:
     """Voice level 0..1 per 50 ms chunk: 0 while there is only background noise (fans, room hum),
     so the bars move only when someone speaks. Only the voice band is measured (120-2200 Hz band-pass:
@@ -521,7 +604,7 @@ class Meter:
         self.floor = None
         self.ref = None
         self.shown = 0.0
-        self.bq = [self._biquad(120, "hp"), self._biquad(2200, "lp")]
+        self.band = VoiceBand()
         self.n = 0
         self.last = 0.0
         self.above = []                                # dB above floor, per chunk (numbers only)
@@ -530,21 +613,8 @@ class Meter:
     def level(self, chunk):
         a = array.array("h")
         a.frombytes(chunk)
-        n = len(a) or 1
         peak = max(max(a, default=0), -min(a, default=0))
-        acc = 0.0
-        (b0, b1, b2, a1, a2, s1), (c0, c1, c2, d1, d2, s2) = self.bq
-        x1, x2, y1, y2 = s1
-        u1, u2, z1, z2 = s2
-        for x in a:                                    # high-pass then low-pass (DC is removed too)
-            y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
-            x2, x1, y2, y1 = x1, x, y1, y
-            z = c0 * y + c1 * u1 + c2 * u2 - d1 * z1 - d2 * z2
-            u2, u1, z2, z1 = u1, y, z1, z
-            acc += z * z
-        s1[:] = [x1, x2, y1, y2]
-        s2[:] = [u1, u2, z1, z2]
-        db = 20 * math.log10(max(math.sqrt(acc / n), 1) / 32768)
+        db = 20 * math.log10(max(math.sqrt(self.band.power(a)), 1) / 32768)
         self.n += 1
         if self.floor is None or self.n <= 6:          # first 0.3 s: learn the room (mic may still settle)
             self.floor = db if self.floor is None else min(self.floor, db)
@@ -576,17 +646,6 @@ class Meter:
             v = min(self.TOP, max(v, self.shown * self.RELEASE))
         self.shown = v if v >= 0.05 else 0.0
         return self.shown
-
-    @staticmethod
-    def _biquad(f0, kind, q=0.7071):
-        w = 2 * math.pi * f0 / RATE
-        al, cw = math.sin(w) / (2 * q), math.cos(w)
-        if kind == "hp":
-            b = [(1 + cw) / 2, -(1 + cw), (1 + cw) / 2]
-        else:
-            b = [(1 - cw) / 2, 1 - cw, (1 - cw) / 2]
-        a0 = 1 + al
-        return (b[0] / a0, b[1] / a0, b[2] / a0, -2 * cw / a0, (1 - al) / a0, [0.0, 0.0, 0.0, 0.0])
 
     def stats(self):
         if len(self.above) < 20:
@@ -642,11 +701,15 @@ class Recognizer:
 
     def __init__(self):
         self.proc = None
-        self.via = None
+        self.via = self.variant = None
         self.ready = None              # load time once the worker said ready
+        self.done = False              # closed for good (recording over or cancelled): no new worker
+        self.waited = 0.0              # how long the first request waited for the model to load
 
     def start(self):
         """Starts the worker without waiting for it (the recording must not be delayed)."""
+        if self.done:
+            raise Fail("Cancelled")
         if self.proc:
             return
         try:
@@ -700,41 +763,230 @@ class Recognizer:
             proc.kill()
             proc.wait()
 
-    def transcribe(self, raw):
-        """raw: 16 kHz mono s16 bytes. Returns (text, log note)."""
+    def _wait_ready(self):
+        """Starts the worker if needed and waits until the model is loaded."""
         self.start()
-        waited = time.monotonic()
         if self.ready is None:
+            t0 = time.monotonic()
             first = self._line(self.proc, LOAD_TIMEOUT_S)
-            if not first or not first.get("ready"):
+            if not first or first.get("ready") is not True:
                 self.close()
                 raise Fail("Speech model failed to start")
             self.ready = first.get("load_s")
-        waited = time.monotonic() - waited
-        seconds = len(raw) / 2 / RATE
+            self.waited = time.monotonic() - t0
+
+    def request(self, raw, settings):
+        """One piece of a recording (Streamer). Returns the worker's answer (parakeet.py, lang
+        "pieces"), checked: {"cands": {code: [text, score]}, "main": code, "asr_s": s, "note": str}."""
+        self._wait_ready()
         try:
-            sp = speech()
-            self.proc.stdin.write(json.dumps({"n": len(raw), "lang": "auto", "langs": sp["languages"],
-                                              "margin": sp["margin"], "gate_db": GATE_DB[sp["voice_gate"]]}
-                                             ).encode() + b"\n")
+            self.proc.stdin.write(json.dumps({"n": len(raw), "lang": "pieces", "langs": settings["languages"],
+                                              "gate_db": GATE_DB[settings["voice_gate"]]}).encode() + b"\n")
             self.proc.stdin.write(raw)
             self.proc.stdin.flush()
-        except OSError:
+        except (OSError, ValueError, AttributeError):    # closed meanwhile by close() (cancel)
             self.close()
             raise Fail("Speech model stopped") from None
-        res = self._line(self.proc, 60 + seconds)
-        if not res or "error" in res:
-            log(f"model error via {self.via}: {(res or {}).get('error', 'no answer')}")
+        res = self._line(self.proc, 60 + len(raw) / 2 / RATE)
+        if not valid_answer(res):
+            err = res.get("error") if isinstance(res, dict) else None
+            log(f"model error via {self.via}: {err if isinstance(err, str) else 'no valid answer'}"[:300])
             self.close()
             raise Fail("Transcription failed")
-        note = (f"{res.get('note')}, {self.variant} via {self.via}, load {self.ready}s (waited {waited:.1f}s), "
-                f"asr {res.get('asr_s')}s")
-        return clean(res.get("text")), note
+        return res
 
-    def close(self):
+    def close(self, done=False):
+        """Stops the worker; done: for good, so a piece still on its way cannot start a new one."""
+        self.done = self.done or done
         if self.proc:
             self._kill(self.proc, self.ready is not None)
         self.proc, self.ready = None, None
+
+
+def valid_answer(res):
+    """The worker's answer to a piece has exactly the expected shape. It runs in a sandbox, but its
+    output is still treated as untrusted input: anything else is an error, never used."""
+    if not isinstance(res, dict) or "error" in res:
+        return False
+    cands, main = res.get("cands"), res.get("main")
+    return (isinstance(cands, dict) and 0 < len(cands) <= len(LANGS) + 1 and main in cands
+            and all(isinstance(c, str) and isinstance(v, list) and len(v) == 2 and isinstance(v[0], str)
+                    and len(v[0]) <= MAX_TEXT and isinstance(v[1], (int, float)) and math.isfinite(v[1])
+                    for c, v in cands.items())
+            and isinstance(res.get("asr_s", 0), (int, float)) and isinstance(res.get("note", ""), str))
+
+
+class Streamer:
+    """Transcribes a recording in pieces WHILE you speak, so the text is there about a second after you
+    stop, however long you spoke (before: 90 s of speech = 6+ s of waiting after the stop).
+    Audio comes in as it is recorded (feed). As soon as there is a pause (PAUSE_S of silence) and the
+    piece is at least MIN_PIECE_S long, the piece is cut in the middle of the pause and sent to the
+    speech model, already loaded, which works on it in a background thread while you go on speaking.
+    When you stop, only the last piece is left.
+    Why pieces of 10..30 s (tested on real Ukrainian dictation): one long piece (a minute or more)
+    drops whole phrases; ~5 s pieces give worse words (too little context); 10-25 s were best.
+    Silence: pieces are trimmed to EDGE_S of silence at both ends, and a piece with almost no voice is
+    not sent at all (from noise the model invents words, e.g. "Well yeah, I'm definitely").
+    Language: each piece comes back decoded in every candidate language (parakeet.py, lang "pieces");
+    the language is chosen once, from the scores summed over the whole recording, because one short
+    piece is too little to tell Ukrainian from Russian.
+    Also used for Retry: the whole recording is fed at once and cut into the same pieces."""
+    FRAME = 640                       # 20 ms of s16 mono
+    MIN_PIECE_S = 10.0
+    PAUSE_S = 0.5                     # a pause that ends a piece of MIN_PIECE_S or more
+    LONG_PIECE_S = 20.0
+    SHORT_PAUSE_S = 0.25              # ...and of LONG_PIECE_S or more
+    MAX_PIECE_S = 30.0                # no pause at all: cut at the quietest 0.2 s of the last 10 s
+    SIL_DB = 10.0                     # a frame is silence below the noise floor + this
+    EDGE_S = 0.3
+    MIN_VOICE_S = 0.25                # less voice than this in a piece: not sent
+
+    def __init__(self, rec, settings=None):
+        import queue
+        import threading
+        self.rec, self.settings = rec, settings or speech()
+        self.buf = bytearray()
+        self.db = []                  # loudness per frame in dB, voice band only
+        self.band = VoiceBand()
+        self.floor, self.floor_at = None, 0
+        self.start_f = 0              # first frame of the current piece
+        self.pieces = []              # [start byte, end byte, the worker's answer or None]
+        self.skipped = 0
+        self.error = None
+        self.stopped = False
+        self.q = queue.Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    # -- background thread: one piece after the other, in order
+    def _run(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            piece, raw = item
+            if self.error or self.stopped:
+                continue
+            for attempt in (1, 2):                 # the worker died: start a new one, try once more
+                try:
+                    piece[2] = self.rec.request(raw, self.settings)
+                    break
+                except Exception as e:             # Fail, or the worker was closed under us (cancel)
+                    if attempt == 2 or self.stopped:
+                        self.error = e if isinstance(e, Fail) else Fail("Transcription failed")
+                        break
+
+    def stop(self):
+        """Cancelled or failed: no new work."""
+        self.stopped = True
+        self.q.put(None)
+
+    # -- cutting
+    def _thr(self):
+        """Silence threshold: the 10th percentile of the last 30 s, plus SIL_DB (updated every 0.5 s)."""
+        n = len(self.db)
+        if self.floor is None or n - self.floor_at >= 25:
+            recent = sorted(self.db[-1500:])
+            self.floor, self.floor_at = recent[len(recent) // 10], n
+        return self.floor + self.SIL_DB
+
+    def feed(self, data):
+        f0 = len(self.buf) // self.FRAME
+        self.buf += data
+        for f in range(f0, len(self.buf) // self.FRAME):
+            a = array.array("h")
+            a.frombytes(self.buf[f * self.FRAME:(f + 1) * self.FRAME])
+            self.db.append(10 * math.log10(self.band.power(a) / 32768 ** 2 + 1e-12))
+            self._maybe_cut()
+
+    def _maybe_cut(self):
+        nf = len(self.db)
+        length = (nf - self.start_f) * 0.02
+        if length < self.MIN_PIECE_S:
+            return
+        thr, run = self._thr(), 0
+        while run < nf - self.start_f and run < 100 and self.db[nf - 1 - run] < thr:
+            run += 1
+        if run * 0.02 >= self.PAUSE_S or (length >= self.LONG_PIECE_S and run * 0.02 >= self.SHORT_PAUSE_S):
+            self._cut(nf - run // 2)
+        elif length >= self.MAX_PIECE_S:
+            best, at = None, nf
+            for f in range(nf - 500, nf - 10):       # the quietest 0.2 s in the last 10 s
+                e = sum(self.db[f:f + 10])
+                if best is None or e < best:
+                    best, at = e, f + 5
+            self._cut(at)
+
+    def _cut(self, end_f, end_byte=None):
+        """The piece [start_f, end_f): trimmed, and sent unless it is (almost) only silence."""
+        s, e = self.start_f, end_f
+        self.start_f = end_f
+        thr = self._thr() if self.db else 0
+        voiced = [f for f in range(s, min(e, len(self.db))) if self.db[f] >= thr]
+        tail = end_byte is not None and end_byte > e * self.FRAME     # the last, partial frame
+        if len(voiced) * 0.02 < self.MIN_VOICE_S:
+            if e > s or tail:
+                self.skipped += 1
+            return
+        edge = int(self.EDGE_S / 0.02)
+        s = max(s, voiced[0] - edge)
+        e2 = min(e, voiced[-1] + 1 + edge)
+        b0, b1 = s * self.FRAME, (end_byte if tail and e2 == e else e2 * self.FRAME)
+        piece = [b0, b1, None]
+        self.pieces.append(piece)
+        self.q.put((piece, bytes(self.buf[b0:b1])))
+
+    # -- the end
+    def finish(self, final):
+        """final: the whole recording exactly as kept. Returns (text, note for the log)."""
+        t0 = time.monotonic()
+        streamed = len(self.pieces)
+        if bytes(self.buf) != final[:len(self.buf)]:          # cannot happen; be safe anyway
+            log(f"stream mismatch after {len(self.buf) / 2 / RATE:.1f}s, transcribing it all again")
+            self.stop()
+            self.thread.join()
+            fresh = Streamer(self.rec, self.settings)
+            fresh.feed(final)
+            return fresh.finish(final)
+        self.feed(final[len(self.buf):])
+        self._cut(len(self.db), len(self.buf))
+        self.q.put(None)
+        self.thread.join(timeout=120 + len(final) / 2 / RATE)
+        if self.thread.is_alive():
+            raise Fail("Transcription timed out")
+        if self.error:
+            raise self.error
+        res = [p[2] for p in self.pieces]
+        if any(r is None for r in res):
+            raise Fail("Transcription failed")
+        lens = [(p[1] - p[0]) / 2 / RATE for p in self.pieces]
+        text, lnote = self.choose(res, max(sum(lens), 0.1))
+        muted = sum(1 for r in res if "muted" in r.get("note", ""))
+        note = (f"{lnote}, {len(self.pieces)} pieces ({streamed} during recording, longest "
+                f"{max(lens, default=0):.1f}s, {self.skipped} silent skipped"
+                f"{f', quieter voices muted in {muted}' if muted else ''}), "
+                f"asr {sum(r.get('asr_s', 0) for r in res):.2f}s, text {time.monotonic() - t0:.2f}s after stop")
+        return text, note
+
+    def choose(self, res, seconds):
+        """(text, log note): the main language unless another candidate is surer, per second summed
+        over all pieces, by more than margin plus the model's known lean to it (LANG_BIAS)."""
+        if not res:
+            return "", "no voice"
+        main = res[0]["main"]
+        codes = [c for c in res[0]["cands"] if all(c in r["cands"] for r in res)]
+        if main not in codes:
+            raise Fail("Transcription failed")
+        texts = {c: [r["cands"][c][0] for r in res] for c in codes}
+        if len(codes) == 1 or all(texts[c] == texts[main] for c in codes):
+            pick, lnote = main, ("lang same" if len(codes) > 1 else f"langs {'+'.join(self.settings['languages'])}")
+        else:
+            score = {c: sum(r["cands"][c][1] for r in res) for c in codes}
+            best = max(codes, key=lambda c: score[c])
+            diff = (score[best] - score[main]) / seconds
+            pick = best if diff > self.settings["margin"] + LANG_BIAS.get((best, main), 0.0) else main
+            lnote = f"lang {pick} ({best}-{main} {diff:+.3f}/s)"
+        return " ".join(t.strip() for t in texts[pick] if t and t.strip()), lnote
 
 
 def sandbox(via, folder=MODEL_DIR, writable=False):
@@ -804,16 +1056,25 @@ def wav_pcm(wav):
         return w.readframes(w.getnframes())
 
 
-def transcribe(wav, seconds, rec=None):
+def transcribe(wav, seconds, rec=None, streamer=None, settings=None):
+    """The text of a whole recording. streamer: the one that got the audio while it was recorded
+    (most pieces are done by now); without it the recording is cut into the same pieces here.
+    settings: speech settings to use instead of the saved ones (a chosen language)."""
     own = rec is None
     rec = rec or Recognizer()
+    settings = settings or speech()
     try:
-        text, note = rec.transcribe(wav_pcm(wav))
+        raw = wav_pcm(wav)
+        if streamer is None:
+            streamer = Streamer(rec, settings)
+            streamer.feed(raw)
+        text, note = streamer.finish(raw)
     finally:
         if own:
             rec.close()
-    text = polish(text)
-    log(f"ok local, {seconds:.1f}s audio, {len(text)} chars, {note}")
+    text = polish(text, settings)
+    engine = f", {rec.variant} via {rec.via}, load {rec.ready}s (waited {rec.waited:.1f}s)" if rec.via else ""
+    log(f"ok local, {seconds:.1f}s audio, {len(text)} chars, {note}{engine}")
     return text
 
 
@@ -839,31 +1100,37 @@ def cleanup_old():
             continue
         for name in names:
             path = os.path.join(d, name)
+            audio_off = d == HISTORY_DIR and name.endswith(".wav") and not p["keep_audio"]
             try:
-                if everything or (keep_s and time.time() - os.path.getmtime(path) > keep_s):
+                if everything or audio_off or (keep_s and time.time() - os.path.getmtime(path) > keep_s):
                     os.unlink(path)
             except OSError:
                 pass
 
 
 def remember(path, text, seconds):
-    """Keep the text (not the audio) in the history (RAM) for the extension's menu; only the newest
-    HISTORY_N stay."""
+    """Keep the text in the history (RAM) for the extension's menu, and the audio too if keep_audio is
+    on (else it is deleted); only the newest HISTORY_N stay."""
     os.makedirs(HISTORY_DIR, mode=0o700, exist_ok=True)
     stamp = os.path.basename(path)[:-4]
-    meta = {"time": int(os.path.getmtime(path)), "seconds": round(seconds, 1), "text": text}
+    save_meta(stamp, {"time": int(os.path.getmtime(path)), "seconds": round(seconds, 1), "text": text})
+    if privacy()["keep_audio"]:
+        os.replace(path, os.path.join(HISTORY_DIR, stamp + ".wav"))
+    else:
+        os.unlink(path)
+    stamps = sorted(n[:-5] for n in os.listdir(HISTORY_DIR) if n.endswith(".json"))
+    for old in stamps[:-HISTORY_N]:
+        for ext in (".json", ".wav"):
+            discard(os.path.join(HISTORY_DIR, old + ext))
+
+
+def save_meta(stamp, meta):
+    """Write a history entry's text and numbers, atomically (the extension may read it meanwhile)."""
     tmp = os.path.join(HISTORY_DIR, f".{stamp}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(meta, f, ensure_ascii=False)
     os.replace(tmp, os.path.join(HISTORY_DIR, stamp + ".json"))
-    os.unlink(path)
-    stamps = sorted(n[:-5] for n in os.listdir(HISTORY_DIR) if n.endswith(".json"))
-    for old in stamps[:-HISTORY_N]:
-        try:
-            os.unlink(os.path.join(HISTORY_DIR, old + ".json"))
-        except FileNotFoundError:
-            pass
 
 
 def discard(path):
@@ -1146,6 +1413,7 @@ def main():
     cleanup_old()
     path = None
     rec = Recognizer()
+    streamer = None
     try:
         try:
             rec.start()                                   # loads while you speak
@@ -1154,7 +1422,8 @@ def main():
                 out(f"E {e}")
                 return
             log(f"model start: {e}")                      # record anyway; the recording is kept
-        raw = record()
+        streamer = Streamer(rec)                          # transcribes pieces while you speak
+        raw = record(streamer)
         if raw is None:
             return
         seconds = len(raw) / 2 / RATE
@@ -1164,7 +1433,7 @@ def main():
         del raw
         path = keep(wav)
         out("S")
-        text = transcribe(wav, seconds, rec=rec)
+        text = transcribe(wav, seconds, rec=rec, streamer=streamer)
         rec.close()
         if not text:
             os.unlink(path)
@@ -1187,7 +1456,9 @@ def main():
         log(f"crash: {type(e).__name__}: {e}")
         out(f"E {type(e).__name__}" + (", recording kept, menu: Retry" if path else ""))
     finally:
-        rec.close()
+        if streamer:
+            streamer.stop()
+        rec.close(done=True)
 
 
 def retry():
@@ -1227,13 +1498,46 @@ def retry():
         rec.close()
 
 
+def redo(stamp, lang=None):
+    """`dictate --redo`: transcribe a history recording again, as `lang` (only that language's letters,
+    plus plain Latin) or with the saved languages. The new text replaces the old one in the history."""
+    cleanup_old()
+    try:
+        if not re.fullmatch(r"rec-\d{8}-\d{6}", stamp) or lang not in (None, *LANGS):
+            raise Fail("Bad request")
+        try:
+            with open(os.path.join(HISTORY_DIR, stamp + ".wav"), "rb") as f:
+                wav = f.read()
+            with open(os.path.join(HISTORY_DIR, stamp + ".json")) as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            raise Fail("That recording is gone") from None
+        if not isinstance(meta, dict):
+            raise Fail("That recording is gone")
+        out("S")
+        settings = speech()
+        if lang:
+            settings["languages"] = [lang]
+        text = transcribe(wav, (len(wav) - 44) / 2 / RATE, settings=settings)
+        if not text:
+            raise Fail("No speech recognised")
+        save_meta(stamp, {**meta, "text": text})
+        out("T " + json.dumps(text, ensure_ascii=False))
+    except Fail as e:
+        out(f"E {e}")
+    except Exception as e:                                # never leave the overlay hanging
+        log(f"redo crash: {type(e).__name__}: {e}")
+        out(f"E {type(e).__name__}")
+
+
 def selftest():
     """Starts the model and transcribes 1 s of silence: checks the runtime and the model files."""
     t0 = time.monotonic()
     rec = Recognizer()
     try:
-        text, note = rec.transcribe(b"\0\0" * RATE)
-        print(f"OK: the speech model works ({note}, {time.monotonic() - t0:.1f}s in all)")
+        res = rec.request(b"\0\0" * RATE, speech())
+        print(f"OK: the speech model works ({rec.variant} via {rec.via}, load {rec.ready}s, "
+              f"asr {res.get('asr_s')}s, {time.monotonic() - t0:.1f}s in all)")
         prefix, _ = sandbox(rec.via)
         try:
             net = subprocess.run(prefix + ["-c", NETCHECK], capture_output=True, text=True,
@@ -1257,6 +1561,8 @@ if __name__ == "__main__":
         selftest()
     elif sys.argv[1:] == ["--retry"]:
         retry()
+    elif sys.argv[1:2] == ["--redo"] and len(sys.argv) in (3, 4):
+        redo(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else None)
     elif sys.argv[1:] == ["--models"]:
         models()
     elif sys.argv[1:2] in (["--download"], ["--remove"]) and len(sys.argv) == 3:

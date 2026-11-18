@@ -4,9 +4,10 @@
 // them too: that is why they are plain files and not GSettings. Written by the settings window
 // (prefs.js), read by the extension. Imports only GLib / Gio: prefs.js runs outside GNOME Shell.
 //   keys          shortcuts, "name = GNOME accelerator" (see HEADER)
-//   privacy       history = on|off, keep_minutes = N, clipboard = on|off
+//   privacy       history = on|off, keep_minutes = N, clipboard = on|off, keep_audio = on|off, again = codes
 //   speech        languages, text options, microphone, model... (see writeSpeech)
 //   replacements  "what you say = what is typed", one per line
+//   pill          where you dragged the recording indicator (see readPillSpot)
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
@@ -15,13 +16,15 @@ export const KEYS_FILE = GLib.build_filenamev([DIR, 'keys']);
 export const CAPS = 'CapsLock';
 export const NONE = 'none';
 export const SAME = 'start';            // finish = the start shortcut again
+export const SHIFT_CAPS = 'Shift+CapsLock';  // finish = Caps Lock pressed while Shift is held
 export const DEFAULTS = Object.freeze({start: '<Control><Alt>space', finish: 'Return', pause: CAPS, cancel: 'Escape'});
 
 const HEADER = `# Dictator keys. Easiest to change in the settings window: top-bar microphone menu ->
 # "Settings", or: gnome-extensions prefs dictator@kcharukovskyi.github.io
 # By hand: name = GNOME accelerator, e.g. <Control><Alt>space  <Super>d  <Control><Shift>d  F9  Pause
 #   start   start a recording (repeat the line for more shortcuts)
-#   finish  while recording: finish and paste (Return = Enter); start = the start shortcut again
+#   finish  while recording: finish and paste (Return = Enter); start = the start shortcut again;
+#           Shift+CapsLock = Caps Lock pressed while Shift is held (the lock is not toggled)
 #   pause   pause / resume while recording; CapsLock = Caps Lock (the lock is not toggled); none = off
 #   cancel  cancel while recording; none = off
 # Applies at once, no log out. A shortcut that GNOME or another app already uses does not work.
@@ -116,20 +119,33 @@ export function takenBy(accel, list = gnomeShortcuts()) {
 }
 
 export const PRIVACY_FILE = GLib.build_filenamev([DIR, 'privacy']);
-export const PRIVACY_DEFAULTS = Object.freeze({history: true, keepMinutes: 60, clipboard: false});
+// again: the languages offered by "Transcribe Again" in the menu; null = the enabled languages
+export const PRIVACY_DEFAULTS = Object.freeze({history: true, keepMinutes: 60, clipboard: false, keepAudio: false,
+    again: null});
 
 export function readPrivacy() {
     const p = {...PRIVACY_DEFAULTS};
+    const codes = new Set(LANGUAGES.map(([c]) => c));
     for (const line of (load(PRIVACY_FILE) ?? '').split('\n')) {
-        const m = line.trim().match(/^(history|keep_minutes|clipboard)\s*=\s*(\S+)$/);
+        const m = line.trim().match(/^(history|keep_minutes|clipboard|keep_audio|again)\s*=\s*(.*)$/);
+        const v = m?.[2].trim();
         if (m?.[1] === 'history')
-            p.history = m[2] !== 'off';
+            p.history = v !== 'off';
         else if (m?.[1] === 'clipboard')
-            p.clipboard = m[2] === 'on';
-        else if (m && /^\d+$/.test(m[2]))
-            p.keepMinutes = parseInt(m[2]);
+            p.clipboard = v === 'on';
+        else if (m?.[1] === 'keep_audio')
+            p.keepAudio = v === 'on';
+        else if (m?.[1] === 'again')
+            p.again = [...new Set(v.split(/[\s,]+/).filter(c => codes.has(c)))];
+        else if (m && /^\d+$/.test(v))
+            p.keepMinutes = parseInt(v);
     }
     return p;
+}
+
+// the languages "Transcribe Again" offers: chosen in Settings, else the enabled ones
+export function againLanguages(p = readPrivacy()) {
+    return p.again ?? readSpeech().languages;
 }
 
 export function writePrivacy(p) {
@@ -140,8 +156,11 @@ export function writePrivacy(p) {
         '# keep_minutes = N: delete kept recordings (also failed ones) after N minutes; 0 = until restart\n' +
         '# clipboard = on|off: apps that cannot take typed text get it by a paste through the clipboard;\n' +
         '#   off: the clipboard is never used, the text waits in the microphone menu\n' +
+        '# keep_audio = on|off: the history keeps the audio too (RAM only), for "Transcribe Again"\n' +
+        '# again = codes: the languages "Transcribe Again" offers (no line: the enabled languages)\n' +
         `history = ${p.history ? 'on' : 'off'}\nkeep_minutes = ${p.keepMinutes}\n` +
-        `clipboard = ${p.clipboard ? 'on' : 'off'}\n`);
+        `clipboard = ${p.clipboard ? 'on' : 'off'}\nkeep_audio = ${p.keepAudio ? 'on' : 'off'}\n` +
+        (p.again ? `again = ${p.again.join(' ')}\n` : ''));
 }
 
 // Speech settings; the helper reads all but space_after and pill.
@@ -224,6 +243,27 @@ export function writeSpeech(p) {
         `model = ${p.model}\n`);
 }
 
+// Where you dragged the recording indicator: its centre as a share of the monitor's width and height
+// (0..1), so it lands in the same spot on any monitor. null: the place chosen in Settings.
+export const PILL_FILE = GLib.build_filenamev([DIR, 'pill']);
+
+export function readPillSpot() {
+    const m = (load(PILL_FILE) ?? '').match(/^\s*x\s*=\s*([\d.]+)\s*\n\s*y\s*=\s*([\d.]+)\s*$/m);
+    const [x, y] = m ? [parseFloat(m[1]), parseFloat(m[2])] : [NaN, NaN];
+    return x >= 0 && x <= 1 && y >= 0 && y <= 1 ? {x, y} : null;
+}
+
+// spot: {x, y} as above, or null to go back to the place chosen in Settings
+export function writePillSpot(spot) {
+    if (!spot) {
+        GLib.unlink(PILL_FILE);
+        return;
+    }
+    GLib.mkdir_with_parents(DIR, 0o700);
+    GLib.file_set_contents(PILL_FILE, '# Dictator: where you dragged the recording indicator (share of the screen)\n' +
+        `x = ${spot.x.toFixed(4)}\ny = ${spot.y.toFixed(4)}\n`);
+}
+
 // the replacements file, created with an explanation the first time
 export function ensureReplacements() {
     if (GLib.file_test(REPLACE_FILE, GLib.FileTest.EXISTS))
@@ -251,6 +291,8 @@ export function cleanText(t) {
 export function prettyAccel(a) {
     if (a === CAPS)
         return 'Caps Lock';
+    if (a === SHIFT_CAPS)
+        return 'Shift+Caps Lock';
     if (a === NONE)
         return 'off';
     const mods = {control: 'Ctrl', primary: 'Ctrl', ctrl: 'Ctrl', alt: 'Alt', super: 'Super', shift: 'Shift',

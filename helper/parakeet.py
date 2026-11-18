@@ -23,6 +23,10 @@ Use:
         {"n": BYTES, "lang": "auto"|code, "langs": [codes, main first], "margin": float, "gate_db": float}
         followed by BYTES of raw 16 kHz mono s16 audio, and answers one JSON line
         {"text", "lang", "asr_s", "note"} or {"error"}. Ends at end of input.
+        lang "pieces" (one piece of a recording that the helper transcribes while you speak, see
+        Streamer in helper/dictate): no choice here, it answers {"cands": {code: [text, score]},
+        "main": code, "asr_s", "note"}, one candidate per enabled Cyrillic language (or one "auto" if
+        fewer than two are on); the helper picks the language once, over all pieces of the recording.
   parakeet.py --quantize DIR   makes DIR/*.int8.onnx from the fp32 files in DIR (8-bit integers, per
         channel, MatMul layers only; needs the onnx package too) and prints {"ok": true} or {"error"}
 """
@@ -182,35 +186,43 @@ class Parakeet:
         enc, elen = self.enc.run(None, {"audio_signal": feats, "length": flen})
         return enc[0], int(elen[0])
 
+    def _run(self, encs, mask):
+        """Decode the encoded pieces of one audio with a token mask: (text, log-probability sum)."""
+        texts, score = [], 0.0
+        for e, n in encs:
+            tk, sc = self._decode(e, n, mask)
+            texts.append(self._text(tk))
+            score += sc
+        return " ".join(filter(None, texts)), score
+
+    def candidates(self, audio, langs=None):
+        """Every candidate language's (text, score) from one encoder pass, and the main one. One
+        candidate per enabled Cyrillic language (they share most letters, so the mask alone cannot
+        tell them apart), or a single "auto" with the letters of all enabled languages."""
+        langs = check_langs(langs)
+        encs = [self._encode(a) for a in split_long(audio)]
+        cyr = [c for c in langs if c in CYRILLIC]
+        if len(cyr) < 2:
+            return {"auto": self._run(encs, self.mask(*allowed(langs)))}, "auto"
+        others = [c for c in langs if c not in CYRILLIC]
+        return {c: self._run(encs, self.mask(*allowed([c] + others))) for c in cyr}, cyr[0]
+
     def transcribe(self, audio, lang="auto", langs=None, margin=MARGIN):
         """audio: float32 [-1, 1] at 16 kHz; langs: enabled languages, main first.
         Returns (text, chosen language, note for the log)."""
         langs = check_langs(langs)
-        if lang != "auto" and lang not in LANGS:
-            raise ValueError("lang")
-        encs = [self._encode(a) for a in split_long(audio)]
-        sec = max(len(audio) / SR, 0.1)
-
-        def run(mask):
-            toks, score = [], 0.0
-            for e, n in encs:
-                tk, sc = self._decode(e, n, mask)
-                toks.append(tk)
-                score += sc
-            return " ".join(filter(None, (self._text(t) for t in toks))), score
-
         if lang != "auto":
-            return run(self.mask(*allowed([lang])))[0], lang, f"lang {lang} (chosen)"
-        cyr = [c for c in langs if c in CYRILLIC]
-        if len(cyr) < 2:
-            return run(self.mask(*allowed(langs)))[0], "auto", f"langs {'+'.join(langs)}"
-        others = [c for c in langs if c not in CYRILLIC]
-        res = {c: run(self.mask(*allowed([c] + others))) for c in cyr}
-        main = cyr[0]
+            if lang not in LANGS:
+                raise ValueError("lang")
+            encs = [self._encode(a) for a in split_long(audio)]
+            return self._run(encs, self.mask(*allowed([lang])))[0], lang, f"lang {lang} (chosen)"
+        res, main = self.candidates(audio, langs)
+        if main == "auto":
+            return res[main][0], "auto", f"langs {'+'.join(langs)}"
         if len({t for t, _ in res.values()}) == 1:   # no letter where they differ (Latin, numbers...)
             return res[main][0], "auto", "lang same"
-        best = max(cyr, key=lambda c: res[c][1])
-        diff = (res[best][1] - res[main][1]) / sec
+        best = max(res, key=lambda c: res[c][1])
+        diff = (res[best][1] - res[main][1]) / max(len(audio) / SR, 0.1)
         pick = best if diff > margin else main
         return res[pick][0], pick, f"lang {pick} ({best}-{main} {diff:+.3f}/s)"
 
@@ -300,11 +312,16 @@ def worker(model_dir, threads=THREADS, fp32=False):
             t0 = time.monotonic()
             audio = np.frombuffer(raw, np.int16).astype(np.float32) / 32768.0
             audio, muted = gate(audio, float(req.get("gate_db") or 0))
-            text, lang, note = m.transcribe(audio, req.get("lang") or "auto", req.get("langs"),
-                                            float(req.get("margin", MARGIN)))
+            if req.get("lang") == "pieces":
+                cands, main = m.candidates(audio, req.get("langs"))
+                res = {"cands": cands, "main": main, "note": ""}
+            else:
+                text, lang, note = m.transcribe(audio, req.get("lang") or "auto", req.get("langs"),
+                                                float(req.get("margin", MARGIN)))
+                res = {"text": text, "lang": lang, "note": note}
             if muted:
-                note += f", quieter voices muted {100 * muted:.0f}%"
-            res = {"text": text, "lang": lang, "note": note, "asr_s": round(time.monotonic() - t0, 2)}
+                res["note"] += f", quieter voices muted {100 * muted:.0f}%"
+            res["asr_s"] = round(time.monotonic() - t0, 2)
         except Exception as e:
             res = {"error": f"{type(e).__name__}: {e}"}
         out.write(json.dumps(res, ensure_ascii=False) + "\n")

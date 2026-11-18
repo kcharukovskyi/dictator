@@ -59,6 +59,18 @@ comment in `extension.js`).
 In the second case the previous clipboard content is restored afterwards, and password-manager entries
 are never put back. No default shortcut acts on the clipboard.
 
+**The pill takes mouse input.** It is reactive so that it can be dragged. While the button is held,
+`global.stage.grab()` sends the motion to it; the grab is dismissed on release, on lock and in
+`disable()`. Its position is saved in `~/.config/dictate/pill` (two numbers).
+
+**Shift+Caps Lock.** Not grabbed: the Caps Lock watch that already exists for the pause key checks
+whether Shift is held (`global.get_pointer()` modifiers) when the lock changes, only while recording.
+
+**Kept audio.** Off by default. With "Keep Audio to Transcribe Again" on, the helper moves the last 3
+recordings into `$XDG_RUNTIME_DIR/dictate-history` (RAM) instead of deleting them; they expire with the
+other kept recordings, and turning the switch off deletes them. `dictate --redo` gets only a stamp
+checked against `rec-\d{8}-\d{6}` and a language code from a fixed list, as separate arguments.
+
 **Monkey-patching.** The `showOSD` method of the quick-settings output slider instance is replaced
 while recording. A Bluetooth headset switches profile when the microphone opens, and GNOME would flash
 the volume OSD several times. `disable()` restores the method (`_unpatchOsd`).

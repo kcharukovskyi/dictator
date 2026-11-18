@@ -10,8 +10,9 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk';
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
-import {readKeys, writeKeys, readPrivacy, writePrivacy, readSpeech, writeSpeech, ensureReplacements,
-    prettyAccel, gnomeShortcuts, LANGUAGES, CAPS, NONE, SAME, DEFAULTS} from './keys.js';
+import {readKeys, writeKeys, readPrivacy, writePrivacy, readSpeech, writeSpeech, ensureReplacements, readPillSpot,
+    writePillSpot, againLanguages, prettyAccel, gnomeShortcuts, LANGUAGES, CAPS, NONE, SAME, SHIFT_CAPS,
+    DEFAULTS} from './keys.js';
 
 const THREAD_CHOICES = [[0, 'Automatic'], [1, '1'], [2, '2'], [4, '4'], [6, '6'], [8, '8']];
 const STOP_CHOICES = [[0, 'Off'], [2, 'After 2 seconds'], [3, 'After 3 seconds'], [5, 'After 5 seconds'],
@@ -76,13 +77,16 @@ const KEEP_CHOICES = [[15, '15 minutes'], [60, '1 hour'], [480, '8 hours'], [0, 
 
 const ROWS = [
     {id: 'start', title: 'Start', hint: 'Starts recording'},
-    {id: 'finish', title: 'Finish and Paste', hint: 'While recording (Enter also means the keypad Enter)', canSame: true},
+    {id: 'finish', title: 'Finish and Paste', hint: 'While recording (Enter also means the keypad Enter)', canSame: true,
+        shiftCaps: true},
     {id: 'pause', title: 'Pause / Resume', hint: 'While recording', canOff: true, caps: true},
     {id: 'cancel', title: 'Cancel', hint: 'While recording', canOff: true},
 ];
 // keys that may be a global shortcut on their own (they type nothing); others need Ctrl, Alt or Super
 const BARE_OK = /^(F\d{1,2}|Pause|Scroll_Lock|Insert|Menu|Print|XF86\w+)$/;
 const MODIFIER_KEY = /^((Shift|Control|Alt|Meta|Super|Hyper)_[LR]|ISO_Level\d_(Shift|Latch|Lock)|Num_Lock|ISO_Next_Group)$/;
+const SPECIAL = [CAPS, NONE, SAME, SHIFT_CAPS];     // key values that are not GNOME accelerators
+const CLOSE_MS = 400;           // the capture window stays this long after a key, taking what comes with it
 function parse(accel) {
     const [ok, key, mods] = Gtk.accelerator_parse(accel);
     return ok && key ? [key, mods] : null;
@@ -114,12 +118,12 @@ export default class DictatorPrefs extends ExtensionPreferences {
             for (const r of ROWS) {
                 const v = r.id === 'start' ? keys.start[0] : keys[r.id];
                 const u = ui[r.id];
-                const real = v !== CAPS && v !== NONE && v !== SAME && !!parse(v);
+                const real = !SPECIAL.includes(v) && !!parse(v);
                 u.accel.visible = real;
                 u.accel.accelerator = real ? v : '';
                 u.text.visible = !real;
-                u.text.label = v === CAPS ? 'Caps Lock' : v === NONE ? 'Off'
-                    : v === SAME ? `${prettyAccel(keys.start[0])} again` : v;
+                u.text.label = v === NONE ? 'Off' : v === SAME ? `${prettyAccel(keys.start[0])} again`
+                    : SPECIAL.includes(v) ? prettyAccel(v) : v;
                 const notes = [r.hint];
                 if (r.id === 'start' && keys.start.length > 1)
                     notes.push(`Also (from the file): ${keys.start.slice(1).join(', ')}`);
@@ -143,7 +147,7 @@ export default class DictatorPrefs extends ExtensionPreferences {
                         return `Already used for “${o.title}”. One key, one job.`;
                 }
             }
-            if (value !== NONE && value !== SAME && value !== CAPS) {
+            if (!SPECIAL.includes(value)) {
                 const clash = taken.find(([a]) => same(a, value));
                 if (clash)
                     return `${prettyAccel(value)} is already used by ${clash[1]}: it would never reach dictation. Choose another one.`;
@@ -189,8 +193,16 @@ export default class DictatorPrefs extends ExtensionPreferences {
     _appearanceGroup() {
         const group = new Adw.PreferencesGroup({title: 'Appearance'});
         const sp = readSpeech();
-        group.add(choiceRow({title: 'Indicator Position', subtitle: 'Where the recording indicator appears'},
-            PILL_CHOICES, sp.pill, v => writeSpeech({...readSpeech(), pill: v})));
+        const dragged = !!readPillSpot();
+        const choices = dragged ? [...PILL_CHOICES, ['dragged', 'Where You Dragged It']] : PILL_CHOICES;
+        group.add(choiceRow({title: 'Indicator Position',
+            subtitle: 'Where the recording indicator appears. You can also drag it with the mouse'},
+        choices, dragged ? 'dragged' : sp.pill, v => {
+            if (v === 'dragged')
+                return;
+            writePillSpot(null);
+            writeSpeech({...readSpeech(), pill: v});
+        }));
         return group;
     }
 
@@ -539,22 +551,52 @@ export default class DictatorPrefs extends ExtensionPreferences {
             keep.model.append(`${p.keepMinutes} minutes`);
             keep.selected = KEEP_CHOICES.length;
         }
+        const audio = new Adw.SwitchRow({title: 'Keep Audio to Transcribe Again',
+            subtitle: 'The recordings of those texts stay in memory too, so the menu can transcribe them ' +
+                'again, also in another language',
+            active: p.keepAudio});
+        // the languages the menu offers; until you change them, the enabled ones (saved only once changed)
+        const again = new Adw.ExpanderRow({title: 'Transcribe Again In'});
+        let chosen = againLanguages(p), touched = p.again !== null;
+        const summary = () => {
+            again.subtitle = chosen.length ? LANGUAGES.filter(([c]) => chosen.includes(c)).map(([, en]) => en)
+                .join(', ') : 'Only as it was';
+        };
+        for (const [code, en, own] of LANGUAGES) {
+            const row = new Adw.SwitchRow({title: en === own ? en : `${en} (${own})`, active: chosen.includes(code)});
+            row.connect('notify::active', () => {
+                chosen = row.active ? [...new Set([...chosen, code])] : chosen.filter(c => c !== code);
+                touched = true;
+                summary();
+                save();
+            });
+            again.add_row(row);
+        }
+        summary();
+        const sync = () => {
+            audio.sensitive = history.active;
+            again.sensitive = history.active && audio.active;
+        };
         const save = () => {
             const minutes = KEEP_CHOICES[keep.selected]?.[0] ?? readPrivacy().keepMinutes;
-            writePrivacy({history: history.active, keepMinutes: minutes, clipboard: clipboard.active});
+            writePrivacy({history: history.active, keepMinutes: minutes, clipboard: clipboard.active,
+                keepAudio: audio.active, again: touched ? chosen : null});
+            sync();
         };
-        history.connect('notify::active', save);
-        clipboard.connect('notify::active', save);
+        for (const w of [history, clipboard, audio])
+            w.connect('notify::active', save);
         keep.connect('notify::selected', save);
-        group.add(clipboard);
-        group.add(history);
-        group.add(keep);
+        sync();
+        for (const w of [clipboard, history, audio, again, keep])
+            group.add(w);
         return group;
     }
 
     // a small window that waits for the new shortcut
     _capture(parent, r, set) {
-        const extra = [r.canOff ? 'Backspace: off' : null, r.canSame ? 'Backspace: the start shortcut again' : null, r.caps ? 'Caps Lock: use Caps Lock' : null]
+        const extra = [r.canOff ? 'Backspace: off' : null,
+            r.canSame ? 'Backspace or the start shortcut: the start shortcut again' : null,
+            r.caps ? 'Caps Lock: use Caps Lock' : null, r.shiftCaps ? 'Shift+Caps Lock works too' : null]
             .filter(Boolean).join(', ');
         const hint = `Esc: keep the old one${extra ? `, ${extra}` : ''}`;
         const dlg = new Adw.Window({transient_for: parent, modal: true, default_width: 460, default_height: 280,
@@ -565,12 +607,25 @@ export default class DictatorPrefs extends ExtensionPreferences {
         box.append(new Adw.HeaderBar());
         box.append(status);
         dlg.set_content(box);
+        // A key can come with a twin: a keyboard tool that turns Shift+Caps Lock into another key sends
+        // both. So the window takes keys a moment longer before it closes, and nothing reaches GNOME.
+        let done = false;
         const finish = value => {
+            if (done)
+                return Gdk.EVENT_STOP;
             const err = set(r.id, value);
-            if (err)
+            if (err) {
                 status.description = `${err}\n${hint}`;
-            else
+                return Gdk.EVENT_STOP;
+            }
+            done = true;
+            status.title = `${r.title}: ${value === SAME ? `${prettyAccel(readKeys().start[0])} again`
+                : prettyAccel(value)}`;
+            status.description = '';
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, CLOSE_MS, () => {
                 dlg.close();
+                return GLib.SOURCE_REMOVE;
+            });
             return Gdk.EVENT_STOP;
         };
         const refuse = msg => {
@@ -580,6 +635,8 @@ export default class DictatorPrefs extends ExtensionPreferences {
         // capture phase: Enter / Space must reach this, not activate the window's close button
         const ctl = new Gtk.EventControllerKey({propagation_phase: Gtk.PropagationPhase.CAPTURE});
         ctl.connect('key-pressed', (c, keyval, keycode, state) => {
+            if (done)
+                return Gdk.EVENT_STOP;
             const mods = state & Gtk.accelerator_get_default_mod_mask() & ~Gdk.ModifierType.LOCK_MASK;
             const name = Gdk.keyval_name(keyval) ?? '';
             if (!mods && keyval === Gdk.KEY_Escape)
@@ -588,8 +645,12 @@ export default class DictatorPrefs extends ExtensionPreferences {
                 return finish(NONE);
             if (!mods && keyval === Gdk.KEY_BackSpace && r.canSame)
                 return finish(SAME);
-            if (keyval === Gdk.KEY_Caps_Lock)
-                return r.caps ? finish(CAPS) : refuse('Caps Lock works only for Pause.');
+            if (keyval === Gdk.KEY_Caps_Lock && mods === Gdk.ModifierType.SHIFT_MASK && r.shiftCaps)
+                return finish(SHIFT_CAPS);
+            if (keyval === Gdk.KEY_Caps_Lock) {
+                return r.caps ? finish(CAPS) : refuse(r.shiftCaps ? 'Caps Lock works here only with Shift.'
+                    : 'Caps Lock works only for Pause.');
+            }
             if (MODIFIER_KEY.test(name))
                 return Gdk.EVENT_STOP;          // wait for the whole combination
             // the key without Shift applied: Shift+1 is <Shift>1, not <Shift>exclam
@@ -606,7 +667,10 @@ export default class DictatorPrefs extends ExtensionPreferences {
                 return refuse('Add Ctrl, Alt or Super: on its own this key would stop typing everywhere.');
             if (!Gtk.accelerator_valid(key, mods))
                 return refuse('That is not a valid shortcut.');
-            return finish(Gtk.accelerator_name(key, mods));
+            const accel = Gtk.accelerator_name(key, mods);
+            if (r.canSame && readKeys().start.some(a => same(a, accel)))    // finish = start: one key toggles
+                return finish(SAME);
+            return finish(accel);
         });
         dlg.add_controller(ctl);
         // let the combination reach this window, not GNOME (e.g. the current dictation shortcut)
