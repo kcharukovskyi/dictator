@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Checks every push and pull request: shell scripts, Python, JavaScript syntax, and the extension
+# package against the extensions.gnome.org review rules (shexli).
+name: Check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell scripts
+        run: shellcheck install.sh uninstall.sh scripts/pack.sh
+
+      - name: Python
+        run: python3 -m py_compile helper/dictate helper/parakeet.py
+
+      - name: JavaScript syntax
+        run: |
+          for f in extension/*.js; do
+            cp "$f" "$RUNNER_TEMP/$(basename "$f" .js).mjs"
+            node --check "$RUNNER_TEMP/$(basename "$f" .js).mjs"
+          done
+
+      - name: Package
+        # the same files scripts/pack.sh puts in (gnome-extensions is not on the runner)
+        run: |
+          mkdir -p dist
+          cd extension
+          zip -q ../dist/extension.zip metadata.json extension.js core.js keys.js prefs.js \
+            stylesheet.css stylesheet-light.css
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: extensions.gnome.org rules (shexli)
+        run: |
+          pip install --quiet shexli==0.2.1
+          shexli dist/extension.zip
+          shexli --format json dist/extension.zip > "$RUNNER_TEMP/shexli.json"
+          python3 - "$RUNNER_TEMP/shexli.json" <<'EOF'
+          import json, sys
+          # EGO-M-004: shexli 0.2.1 takes every GNOME after 50 for a future release; 51 is stable.
+          KNOWN = {"EGO-M-004"}
+          findings = json.load(open(sys.argv[1]))["findings"]
+          bad = [f for f in findings if f["severity"] in ("error", "warning") and f["rule_id"] not in KNOWN]
+          for f in bad:
+              print(f"::error::{f['rule_id']}: {f['message']}")
+          sys.exit(1 if bad else 0)
+          EOF
