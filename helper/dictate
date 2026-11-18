@@ -122,7 +122,7 @@ def privacy():
 #   spoken_punctuation = off|on   say "кома", "знак питання", "новий рядок"... (uk, ru, en)
 #   fillers = on|off        remove hesitation sounds: "еее", "ммм", "um", "uh"
 #   space_after = on|off    (used by the extension: a space after the typed text)
-#   microphone = default    or a PipeWire source name (pactl list short sources)
+#   microphone = default    or a PipeWire source name (node.name in pw-dump)
 #   auto_stop = 0           finish by itself after this many seconds of silence (0 = never)
 #   voice_gate = off|light|medium|strong   mute sound much quieter than your voice (other people)
 #   pill = bottom|top       (used by the extension)
@@ -301,36 +301,36 @@ def pw_record(extra):
     return proc
 
 
-def builtin_mic():
-    """The first wired/built-in microphone (not Bluetooth, not a monitor of an output)."""
+def pw_sources():
+    """([(name, description)] of the microphones, the default one's name), from PipeWire (pw-dump)."""
     try:
-        lines = subprocess.run(["pactl", "list", "short", "sources"], capture_output=True, text=True,
-                               timeout=2).stdout.splitlines()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    for line in lines:
-        parts = line.split("\t")
-        if len(parts) > 1 and not parts[1].endswith(".monitor") and not parts[1].startswith("bluez_"):
-            return parts[1]
-    return None
+        objs = json.loads(subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=3).stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return [], ""
+    mics, default = [], ""
+    for o in objs:
+        props = (o.get("info") or {}).get("props") or {}
+        if props.get("media.class") == "Audio/Source" and props.get("node.name"):
+            mics.append((props["node.name"], props.get("node.description") or props["node.name"]))
+        if (o.get("props") or {}).get("metadata.name") == "default":
+            for m in o.get("metadata") or []:
+                if m.get("key") == "default.audio.source" and isinstance(m.get("value"), dict):
+                    default = m["value"].get("name") or ""
+    return mics, default
+
+
+def builtin_mic():
+    """The first wired/built-in microphone (not Bluetooth)."""
+    return next((n for n, _ in pw_sources()[0] if not n.startswith("bluez_")), None)
 
 
 def sources():
-    """names of the real microphones (not monitors of outputs)"""
-    try:
-        lines = subprocess.run(["pactl", "list", "short", "sources"], capture_output=True, text=True,
-                               timeout=2).stdout.splitlines()
-    except (OSError, subprocess.SubprocessError):
-        return []
-    return [p[1] for p in (line.split("\t") for line in lines) if len(p) > 1 and not p[1].endswith(".monitor")]
+    """names of the microphones"""
+    return [n for n, _ in pw_sources()[0]]
 
 
 def default_source():
-    try:
-        return subprocess.run(["pactl", "get-default-source"], capture_output=True, text=True,
-                              timeout=2).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return ""
+    return pw_sources()[1]
 
 
 def is_live(chunk):

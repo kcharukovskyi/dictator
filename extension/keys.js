@@ -233,7 +233,7 @@ export function writeSpeech(p) {
         '# margin: how much surer another Cyrillic language must be than the main one (0.15)\n' +
         '# threads: CPU threads for the model, 0 = automatic; final_period: keep|drop|chats; space_after: on|off\n' +
         '# spoken_punctuation: on|off ("кома", "знак питання", "новий рядок"...); fillers: on|off (remove "еее", "um")\n' +
-        '# microphone: default or a source name (pactl list short sources); auto_stop: seconds of silence, 0 = off\n' +
+        '# microphone: default or a PipeWire source name (node.name in pw-dump); auto_stop: seconds of silence, 0 = off\n' +
         '# voice_gate: off|light|medium|strong (mute sound much quieter than your voice); pill: bottom|top\n' +
         '# model: int8|fp32 (the model variant, if installed)\n' +
         `languages = ${p.languages.join(' ')}\nmargin = ${p.margin}\nthreads = ${p.threads}\n` +

@@ -31,8 +31,8 @@ Then log out and log in once.
 
 `install.sh` installs into your home folder only and never asks for sudo. It does the following:
 
-1. Checks for `pw-record` and `pactl`. If one is missing, it prints the install command for your
-   distribution.
+1. Checks for `pw-record` and `pw-dump` (PipeWire tools). If one is missing, it prints the install
+   command for your distribution.
 2. Picks where the model runs:
    - the system packages `python3-onnxruntime`, `python3-numpy` and `python3-onnx`, sandboxed with
      bubblewrap, or

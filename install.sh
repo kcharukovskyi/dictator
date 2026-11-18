@@ -60,8 +60,8 @@ else
   echo "WARNING: GNOME Shell not found. Dictator is a GNOME extension."
 fi
 missing=()
-command -v pw-record >/dev/null || missing+=("pw-record: $(pkg pipewire-utils pipewire-bin pipewire pipewire-tools)")
-command -v pactl >/dev/null || missing+=("pactl: $(pkg pulseaudio-utils pulseaudio-utils libpulse pulseaudio-utils)")
+command -v pw-record >/dev/null && command -v pw-dump >/dev/null ||
+  missing+=("pw-record, pw-dump: $(pkg pipewire-utils pipewire-bin pipewire pipewire-tools)")
 [ -x "$PY" ] || missing+=("$PY: $(pkg python3 python3 python python3)")
 if [ ${#missing[@]} -gt 0 ]; then
   echo "Missing programs:"; printf '  %s\n' "${missing[@]}"

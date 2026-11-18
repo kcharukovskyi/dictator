@@ -44,14 +44,15 @@ function modelInfo() {
     }
 }
 
-// [[source name, description]] of the real microphones (not monitors of outputs), from PipeWire
+// [[source name, description]] of the microphones, from PipeWire
 function microphones() {
     try {
-        const proc = Gio.Subprocess.new(['pactl', '-f', 'json', 'list', 'sources'],
+        const proc = Gio.Subprocess.new(['pw-dump'],
             Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE);
         const [, out] = proc.communicate_utf8(null, null);
-        return JSON.parse(out).filter(src => src.name && !src.name.endsWith('.monitor') && !src.monitor_source)
-            .map(src => [src.name, src.description || src.name]);
+        return JSON.parse(out).map(o => o.info?.props ?? {})
+            .filter(p => p['media.class'] === 'Audio/Source' && p['node.name'])
+            .map(p => [p['node.name'], p['node.description'] || p['node.name']]);
     } catch (e) {
         return [];
     }
