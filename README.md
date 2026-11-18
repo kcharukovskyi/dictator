@@ -10,7 +10,8 @@ account, no API key and no cloud.
 - **25 European languages.** Turn on the ones you speak, and mix them freely: English words inside
   Ukrainian stay English. The model is
   [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3).
-- **Works on a plain CPU.** A short phrase is ready about a second after you stop talking.
+- **Works on a plain CPU.** The text is ready about a second after you stop talking, even after
+  minutes of dictation: the recording is transcribed in pieces while you speak.
 - **Native look.** A small libadwaita-style pill shows your voice level. The top-bar icon has a menu
   with your last texts.
 
@@ -78,7 +79,7 @@ The same can be done in a terminal: `dictate --download int8` (or `fp32`), `dict
 | Keys | Action |
 |---|---|
 | **Ctrl+Alt+Space** | Start recording |
-| **Enter** (while recording) | Finish. The text is typed in; the Enter key does not reach the app |
+| **Enter** (while recording) | Finish. The text is typed in; the Enter key does not reach the app. Can be another key, Shift+Caps Lock, or the start shortcut again |
 | **Caps Lock** (while recording) | Pause / resume. Caps Lock itself is not toggled |
 | **Esc** (while recording) | Cancel |
 
@@ -86,6 +87,11 @@ You can change every key in Settings, and changes apply at once. Settings refuse
 GNOME already owns (for example, Super+Space switches the input source).
 
 - The text goes to the window where you **started** recording, even if you switched away meanwhile.
+- Drag the recording indicator with the mouse to move it; it stays there. A double-click puts it back.
+- Long dictation: while you speak, the recording is cut at your pauses into pieces of 10 to 30
+  seconds, and each piece is transcribed in the background. Pieces of that length also give better
+  text than one long piece, which can drop whole phrases. Stretches with no voice are skipped, so
+  the model cannot invent words from noise.
 - Some apps don't accept typed text (some X11 and Electron apps). For them, the text waits in the
   top-bar menu, where one click copies it. If you allow it in Settings, Dictator pastes the text
   through the clipboard instead, then puts back what the clipboard held before.

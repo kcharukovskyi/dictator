@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Long dictation is transcribed while you speak: the helper cuts the recording at pauses into pieces
+  of 10 to 30 seconds and sends each one to the already loaded model in the background. The text is
+  ready about a second after you stop, however long you spoke (90 s of speech: 0.7 s instead of
+  6.4 s). Pieces with no voice are skipped. The language is still chosen once, over the whole
+  recording. Retry uses the same pieces.
+- The recording indicator can be dragged with the mouse. Its place is remembered
+  (`~/.config/dictate/pill`); a double-click, or choosing a position in Settings, puts it back.
+- Finish key: Shift+Caps Lock can finish a recording (the lock is not toggled), and pressing a start
+  shortcut in the "Finish and Paste" dialog makes the start shortcut finish too.
+
 ## 1.0.0 (unreleased): first public release
 
 - The helper program (`helper/`), `install.sh` and `uninstall.sh` are in the repository.
