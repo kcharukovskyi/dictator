@@ -14,8 +14,8 @@ account, no API key and no cloud.
   [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3).
 - **Works on a plain CPU.** The text is ready about a second after you stop talking, even after
   minutes of dictation: the recording is transcribed in pieces while you speak.
-- **Native look.** A small libadwaita-style pill shows your voice level. The top-bar icon has a menu
-  with your last texts.
+- **Native look.** A small libadwaita-style pill shows your voice level and the icon of the app
+  your words will go to. The top-bar icon has a menu with your last texts.
 
 ## Install
 
@@ -50,7 +50,9 @@ free memory while dictating, and 1 GB of disk for the model.
 
 ## The speech model
 
-Open **microphone menu → Settings → Speech → Speech Model** and pick one of two variants:
+Open **microphone menu → Settings → Speech → Speech Model** and pick one of two variants. **Try
+Dictation**, in the same section, records a sentence and shows the text right there: it types
+nothing anywhere and keeps nothing.
 
 | Variant | Download | On disk | Notes |
 |---|---|---|---|

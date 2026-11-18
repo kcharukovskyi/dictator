@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Settings → Speech → Speech Model → **Try Dictation**: record a sentence and see the text right
+  there, typed nowhere and kept nowhere (`dictate --try`). Without the helper, the settings window
+  shows the install command, ready to select and copy.
+- The recording indicator shows the icon of the app the text will go to, while you speak and while
+  it is transcribed.
+- Microphones are found with `pw-dump` (pipewire-utils) instead of `pactl`, which PipeWire-only
+  systems do not install.
+- In GNOME Shell the settings files are read asynchronously and kept in memory (no synchronous file
+  IO in the Shell); the start shortcut is grabbed once the keys file is read.
+- A GitHub Actions check on every push: shellcheck, Python, JavaScript syntax, and the extension
+  package against the extensions.gnome.org rules (shexli).
 - Long dictation is transcribed while you speak: the helper cuts the recording at pauses into pieces
   of 10 to 30 seconds and sends each one to the already loaded model in the background. The text is
   ready about a second after you stop, however long you spoke (90 s of speech: 0.7 s instead of

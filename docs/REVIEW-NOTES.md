@@ -18,7 +18,9 @@ GJS bindings, and a model of about 1 GB.
 - `disable()` cancels a running recording and calls `force_exit()` on a running Retry.
 - `kitten @ ls/focus-window` (kitty's own CLI) is run only if kitty is installed, to return to the
   right tab. It is killed after 3 s.
-- `prefs.js` runs `dictate --models`, `--download` and `--remove` for the Speech Model section.
+- `prefs.js` runs `dictate --models`, `--download` and `--remove` for the Speech Model section, and
+  `dictate --try` for Try Dictation. That is a test recording whose text is shown in the window and
+  is neither typed nor kept. Closing the window cancels it.
 
 **Network.** The extension has no network access.
 - The model download is in the helper. It runs only after the user clicks Download in preferences
