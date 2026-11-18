@@ -30,12 +30,88 @@ const HEADER = `# Dictator keys. Easiest to change in the settings window: top-b
 # Applies at once, no log out. A shortcut that GNOME or another app already uses does not work.
 `;
 
+// Where the read*() functions get the files' text from: in GNOME Shell, from SettingsCache (read
+// asynchronously, kept in memory); in the settings window, which runs in its own process, prefs.js
+// sets a reader that reads the file. The reader returns the text, or null when there is no file.
+let reader = () => null;
+
+export function setReader(fn) {
+    reader = fn ?? (() => null);
+}
+
 function load(path) {
-    try {
-        const [, bytes] = GLib.file_get_contents(path);
-        return new TextDecoder().decode(bytes);
-    } catch (e) {
-        return null;
+    return reader(path);
+}
+
+const WATCHED = () => [KEYS_FILE, PRIVACY_FILE, SPEECH_FILE, PILL_FILE];
+
+// The settings files for GNOME Shell: read asynchronously at start and again whenever one changes
+// (the settings window writes them), kept in memory for the read*() functions. onChange(path) is
+// called once a file's new text is in.
+export class SettingsCache {
+    constructor(onChange) {
+        this._onChange = onChange;
+        this._texts = new Map();
+        this._seq = new Map();
+    }
+
+    start() {
+        this._cancellable = new Gio.Cancellable();
+        setReader(path => this._texts.get(path) ?? null);
+        const dir = Gio.File.new_for_path(DIR);
+        try {
+            dir.make_directory_with_parents(null);
+        } catch (e) {}                  // already there
+        try {
+            this._monitor = dir.monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, null);
+            this._monitorId = this._monitor.connect('changed', (m, file, other) => {
+                for (const f of [file, other]) {
+                    if (f && WATCHED().includes(f.get_path()))
+                        this._load(f.get_path());
+                }
+            });
+        } catch (e) {
+            console.warn(`dictator: cannot watch ${DIR}: ${e}`);
+        }
+        for (const path of WATCHED())
+            this._load(path);
+    }
+
+    // whether the file was read at least once
+    has(path) {
+        return this._texts.has(path);
+    }
+
+    _load(path) {
+        const seq = (this._seq.get(path) ?? 0) + 1;     // a save is several events: only the last counts
+        this._seq.set(path, seq);
+        Gio.File.new_for_path(path).load_contents_async(this._cancellable, (f, res) => {
+            let text = null;
+            try {
+                const [, bytes] = f.load_contents_finish(res);
+                text = new TextDecoder().decode(bytes);
+            } catch (e) {
+                if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    return;
+            }
+            if (this._seq.get(path) !== seq || (this._texts.has(path) && this._texts.get(path) === text))
+                return;
+            this._texts.set(path, text);
+            this._onChange?.(path);
+        });
+    }
+
+    stop() {
+        this._cancellable?.cancel();
+        this._cancellable = null;
+        if (this._monitorId)
+            this._monitor.disconnect(this._monitorId);
+        this._monitorId = 0;
+        this._monitor?.cancel();
+        this._monitor = null;
+        this._texts.clear();
+        this._seq.clear();
+        setReader(null);
     }
 }
 
@@ -94,7 +170,7 @@ export function gnomeShortcuts() {
         const schema = src?.lookup(id, true);
         if (!schema)
             continue;
-        const s = new Gio.Settings({settings_schema: schema});
+        const s = Gio.Settings.new_full(schema, null, null);
         for (const k of schema.list_keys()) {
             if (k === 'custom-keybindings' || schema.get_key(k).get_value_type().dup_string() !== 'as')
                 continue;
@@ -104,7 +180,7 @@ export function gnomeShortcuts() {
         const custom = src.lookup(CUSTOM, true);
         if (id.endsWith('media-keys') && custom) {
             for (const path of s.get_strv('custom-keybindings')) {
-                const c = new Gio.Settings({settings_schema: custom, path});
+                const c = Gio.Settings.new_full(custom, null, path);
                 out.push([c.get_string('binding'), `your custom shortcut “${c.get_string('name')}”`]);
             }
         }
@@ -254,14 +330,27 @@ export function readPillSpot() {
 }
 
 // spot: {x, y} as above, or null to go back to the place chosen in Settings
+// asynchronous (it is written from GNOME Shell, when you drop the pill); null forgets the place
 export function writePillSpot(spot) {
+    const file = Gio.File.new_for_path(PILL_FILE);
     if (!spot) {
-        GLib.unlink(PILL_FILE);
+        file.delete_async(GLib.PRIORITY_DEFAULT, null, (f, res) => {
+            try {
+                f.delete_finish(res);
+            } catch (e) {}              // there was none
+        });
         return;
     }
-    GLib.mkdir_with_parents(DIR, 0o700);
-    GLib.file_set_contents(PILL_FILE, '# Dictator: where you dragged the recording indicator (share of the screen)\n' +
-        `x = ${spot.x.toFixed(4)}\ny = ${spot.y.toFixed(4)}\n`);
+    const text = '# Dictator: where you dragged the recording indicator (share of the screen)\n' +
+        `x = ${spot.x.toFixed(4)}\ny = ${spot.y.toFixed(4)}\n`;
+    file.replace_contents_bytes_async(new GLib.Bytes(new TextEncoder().encode(text)), null, false,
+        Gio.FileCreateFlags.PRIVATE | Gio.FileCreateFlags.REPLACE_DESTINATION, null, (f, res) => {
+            try {
+                f.replace_contents_finish(res);
+            } catch (e) {
+                console.warn(`dictator: cannot save the pill position: ${e.message}`);
+            }
+        });
 }
 
 // the replacements file, created with an explanation the first time

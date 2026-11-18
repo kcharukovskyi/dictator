@@ -135,6 +135,9 @@ export class Core {
         this._indicator = null;
         this._sideProc?.force_exit();
         this._sideProc = null;
+        this._historyCancel?.cancel();
+        this._historyCancel = null;
+        this._historyList = null;
         if (this._expireId)
             GLib.source_remove(this._expireId);
         this._expireId = 0;
@@ -821,35 +824,60 @@ export class Core {
         this._section = new PopupMenu.PopupMenuSection();
         ind.menu.addMenuItem(this._section);
         ind.menu.connect('open-state-changed', (m, open) => {
-            if (open)
-                this._fillMenu();
+            if (!open)
+                return;
+            this._fillMenu();           // at once, with the texts read last time, then the new ones
+            this._loadHistory(() => {
+                if (this._indicator?.menu.isOpen)
+                    this._fillMenu();
+            });
         });
         this._fillMenu();           // a menu without items does not open
         Main.panel.addToStatusArea('dictation-history', ind, 0, 'right');
     }
 
+    // the recent texts, kept by the helper in RAM ($XDG_RUNTIME_DIR/dictate-history), as last read
     _history() {
-        const list = [];
-        let dir;
+        return this._historyList ?? [];
+    }
+
+    // read them again, asynchronously; done() once they are in
+    _loadHistory(done) {
+        const names = [];
         try {
-            dir = GLib.Dir.open(HISTORY_DIR, 0);
-        } catch (e) {
-            return list;
+            const dir = GLib.Dir.open(HISTORY_DIR, 0);
+            let name;
+            while ((name = dir.read_name()) !== null) {
+                if (/^rec-\d{8}-\d{6}\.json$/.test(name))
+                    names.push(name);
+            }
+            dir.close();
+        } catch (e) {}                  // no history yet
+        this._historyCancel?.cancel();
+        const cancel = this._historyCancel = new Gio.Cancellable();
+        const list = [];
+        let left = names.length;
+        const finish = () => {
+            if (cancel.is_cancelled())
+                return;
+            this._historyList = list;
+            done();
+        };
+        if (!left)
+            finish();
+        for (const name of names) {
+            Gio.File.new_for_path(`${HISTORY_DIR}/${name}`).load_contents_async(cancel, (f, res) => {
+                try {
+                    const [, bytes] = f.load_contents_finish(res);
+                    const h = JSON.parse(new TextDecoder().decode(bytes));
+                    const stamp = name.slice(0, -5);
+                    list.push({stamp, time: Number(h.time) || 0, text: cleanText(h.text),
+                        audio: GLib.file_test(`${HISTORY_DIR}/${stamp}.wav`, GLib.FileTest.IS_REGULAR)});
+                } catch (e) {}          // gone meanwhile, or cancelled
+                if (--left === 0)
+                    finish();
+            });
         }
-        let name;
-        while ((name = dir.read_name()) !== null) {
-            if (!/^rec-\d{8}-\d{6}\.json$/.test(name))
-                continue;
-            try {
-                const [, b] = GLib.file_get_contents(`${HISTORY_DIR}/${name}`);
-                const h = JSON.parse(new TextDecoder().decode(b));
-                const stamp = name.slice(0, -5);
-                list.push({stamp, time: Number(h.time) || 0, text: cleanText(h.text),
-                    audio: GLib.file_test(`${HISTORY_DIR}/${stamp}.wav`, GLib.FileTest.IS_REGULAR)});
-            } catch (e) {}
-        }
-        dir.close();
-        return list;
     }
 
     _failedCount() {
@@ -1083,12 +1111,8 @@ export class Core {
         const m = this._monitor;
         if (drag.moved && m) {
             const [w, h] = this._pill.get_size();
-            try {
-                writePillSpot({x: Math.min(1, Math.max(0, (this._pill.x + w / 2 - m.x) / m.width)),
-                    y: Math.min(1, Math.max(0, (this._pill.y + h / 2 - m.y) / m.height))});
-            } catch (e) {
-                console.warn(`dictator: cannot save the pill position: ${e.message}`);
-            }
+            writePillSpot({x: Math.min(1, Math.max(0, (this._pill.x + w / 2 - m.x) / m.width)),
+                y: Math.min(1, Math.max(0, (this._pill.y + h / 2 - m.y) / m.height))});
         }
         if (this._hideAfterDrag) {
             this._hideAfterDrag = false;

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // SPDX-FileCopyrightText: 2025-2026 The Dictator authors (see AUTHORS)
-// Dictator: offline voice dictation. This file grabs the start shortcut(s) from ~/.config/dictate/keys
-// (see keys.js) and watches that file, so a change applies at once; a shortcut that cannot be grabbed
-// (taken by GNOME or another app) is reported in a notification. Everything else is in core.js.
-import Gio from 'gi://Gio';
+// Dictator: offline voice dictation. This file keeps the settings files in memory (SettingsCache in
+// keys.js: read asynchronously, again whenever one changes, so a change applies at once) and grabs the
+// start shortcut(s) from ~/.config/dictate/keys; a shortcut that cannot be grabbed (taken by GNOME or
+// another app) is reported in a notification. Everything else is in core.js.
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
-import {readKeys, prettyAccel, gnomeShortcuts, takenBy, DEFAULTS, KEYS_FILE} from './keys.js';
+import {readKeys, prettyAccel, gnomeShortcuts, takenBy, SettingsCache, DEFAULTS, KEYS_FILE} from './keys.js';
 import {Core} from './core.js';
 
 export default class Dictator extends Extension {
@@ -21,7 +21,8 @@ export default class Dictator extends Extension {
         if (!this._locked)
             this._connectKeys();
         this._sessionId = Main.sessionMode.connect('updated', () => this._onSession());
-        this._watchKeys();
+        this._settings = new SettingsCache(path => this._onSettings(path));
+        this._settings.start();
         this._core = new Core({openPrefs: () => this.openPreferences()});
         this._core.enable();
     }
@@ -35,14 +36,14 @@ export default class Dictator extends Extension {
         if (this._sessionId)
             Main.sessionMode.disconnect(this._sessionId);
         this._sessionId = null;
-        this._monitor?.cancel();
-        this._monitor = null;
         if (this._regrabId)
             GLib.source_remove(this._regrabId);
         this._regrabId = 0;
         this._disconnectKeys();
         this._core?.disable();
         this._core = null;
+        this._settings?.stop();
+        this._settings = null;
     }
 
     // screen locked: no keyboard signals or grabs at all; back after the unlock
@@ -74,8 +75,8 @@ export default class Dictator extends Extension {
 
     // (re)grab the start shortcut(s) from the keys file, if they changed
     _grabStart() {
-        if (this._locked || !this._accelId)
-            return;
+        if (this._locked || !this._accelId || !this._settings?.has(KEYS_FILE))
+            return;                     // not yet: the keys file is still being read
         const list = readKeys().start;
         const sig = JSON.stringify(list);
         if (sig === this._startKeys)
@@ -103,28 +104,16 @@ export default class Dictator extends Extension {
         }
     }
 
-    _watchKeys() {
-        const dir = Gio.File.new_for_path(GLib.path_get_dirname(KEYS_FILE));
-        try {
-            dir.make_directory_with_parents(null);
-        } catch (e) {}              // already there
-        const name = GLib.path_get_basename(KEYS_FILE);
-        try {
-            this._monitor = dir.monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, null);
-        } catch (e) {
-            console.warn(`dictator: cannot watch ${dir.get_path()}: ${e}`);
+    // a settings file was read (at start, or after a change): the keys may be new
+    _onSettings(path) {
+        if (path !== KEYS_FILE)
             return;
-        }
-        this._monitor.connect('changed', (m, file, other) => {
-            if (![file, other].some(f => f?.get_basename() === name))
-                return;
-            if (this._regrabId)     // a save is several events: act once, a moment later
-                GLib.source_remove(this._regrabId);
-            this._regrabId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
-                this._regrabId = 0;
-                this._grabStart();
-                return GLib.SOURCE_REMOVE;
-            });
+        if (this._regrabId)
+            GLib.source_remove(this._regrabId);
+        this._regrabId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
+            this._regrabId = 0;
+            this._grabStart();
+            return GLib.SOURCE_REMOVE;
         });
     }
 

@@ -10,7 +10,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk';
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
-import {readKeys, writeKeys, readPrivacy, writePrivacy, readSpeech, writeSpeech, ensureReplacements, readPillSpot,
+import {setReader, readKeys, writeKeys, readPrivacy, writePrivacy, readSpeech, writeSpeech, ensureReplacements, readPillSpot,
     writePillSpot, againLanguages, prettyAccel, gnomeShortcuts, LANGUAGES, CAPS, NONE, SAME, SHIFT_CAPS,
     DEFAULTS} from './keys.js';
 
@@ -100,8 +100,22 @@ function same(a, b) {
     return !!pa && !!pb && pa[0] === pb[0] && pa[1] === pb[1];
 }
 
+// row subtitles, toasts and status descriptions are Pango markup: plain text (an accelerator like
+// <Super>d, an error message) must be escaped
+const esc = text => GLib.markup_escape_text(text, -1);
+
+// the settings window runs in its own process, not in GNOME Shell: it reads the settings files directly
+function readFile(path) {
+    try {
+        return new TextDecoder().decode(GLib.file_get_contents(path)[1]);
+    } catch (e) {
+        return null;
+    }
+}
+
 export default class DictatorPrefs extends ExtensionPreferences {
     fillPreferencesWindow(window) {
+        setReader(readFile);
         window.set_default_size(640, 640);
         window.set_search_enabled(true);
         const page = new Adw.PreferencesPage({title: 'General', icon_name: 'preferences-system-symbolic'});
@@ -127,11 +141,11 @@ export default class DictatorPrefs extends ExtensionPreferences {
                     : SPECIAL.includes(v) ? prettyAccel(v) : v;
                 const notes = [r.hint];
                 if (r.id === 'start' && keys.start.length > 1)
-                    notes.push(`Also (from the file): ${keys.start.slice(1).join(', ')}`);
+                    notes.push(`Also (from the file): ${keys.start.slice(1).map(prettyAccel).join(', ')}`);
                 const clash = real && taken.find(([a]) => same(a, v));
                 if (clash)
                     notes.push(`⚠ Already used by ${clash[1]}: will not work, choose another`);
-                u.row.subtitle = notes.join('\n');
+                u.row.subtitle = esc(notes.join('\n'));
                 u.reset.sensitive = v !== DEFAULTS[r.id];
             }
         };
@@ -312,7 +326,7 @@ export default class DictatorPrefs extends ExtensionPreferences {
                 try {
                     Gio.AppInfo.launch_default_for_uri_finish(res);
                 } catch (e) {
-                    repl.subtitle = `Open it by hand: ${file.get_path()}`;
+                    repl.subtitle = esc(`Open it by hand: ${file.get_path()}`);
                 }
             });
         });
@@ -385,7 +399,7 @@ export default class DictatorPrefs extends ExtensionPreferences {
             group.add(row);
             return [group, false];
         }
-        const toast = title => window.add_toast(new Adw.Toast({title, timeout: 5}));
+        const toast = title => window.add_toast(new Adw.Toast({title: esc(title), timeout: 5}));
         const rows = new Map();
         let job = null;             // {id, proc, pulse, cancelled}
         let updating = false;
@@ -616,7 +630,7 @@ export default class DictatorPrefs extends ExtensionPreferences {
                 return Gdk.EVENT_STOP;
             const err = set(r.id, value);
             if (err) {
-                status.description = `${err}\n${hint}`;
+                status.description = esc(`${err}\n${hint}`);
                 return Gdk.EVENT_STOP;
             }
             done = true;
@@ -630,7 +644,7 @@ export default class DictatorPrefs extends ExtensionPreferences {
             return Gdk.EVENT_STOP;
         };
         const refuse = msg => {
-            status.description = `${msg}\n${hint}`;
+            status.description = esc(`${msg}\n${hint}`);
             return Gdk.EVENT_STOP;
         };
         // capture phase: Enter / Space must reach this, not activate the window's close button

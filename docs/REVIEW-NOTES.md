@@ -1,10 +1,5 @@
 # Notes for extensions.gnome.org reviewers
 
-Upload `dist/dictator@kcharukovskyi.github.io.shell-extension.zip`, which `scripts/pack.sh` builds.
-Paste the section below into the review comment, and keep it true when the code changes.
-
----
-
 **What it does.** Offline voice dictation. The extension draws the UI: a pill at the bottom of the
 screen, a top-bar icon with a menu, and the preferences window. It talks to a separate helper program
 over stdin and stdout. The helper records with `pw-record` and runs a speech model in a sandbox
@@ -76,8 +71,19 @@ while recording. A Bluetooth headset switches profile when the microphone opens,
 the volume OSD several times. `disable()` restores the method (`_unpatchOsd`).
 
 **Settings storage.** Settings are plain files in `~/.config/dictate` rather than GSettings, because
-the Python helper reads the same files without GObject bindings. `prefs.js` writes them, and
-`extension.js` watches the keys file so that shortcut changes apply at once.
+the Python helper reads the same files without GObject bindings. `prefs.js` writes them.
+- **No synchronous file IO in the Shell.** In the Shell, `SettingsCache` (`keys.js`) reads the files
+  with `load_contents_async()` at enable and again whenever the directory monitor reports a change.
+  It keeps the text in memory for the `read*()` functions. Shortcut changes therefore apply at once.
+- **Other files.** The recent texts in the menu are read asynchronously when the menu opens. The pill
+  position is written with `replace_contents_bytes_async()`.
+- **`prefs.js`.** It runs in its own process and reads the files directly.
+
+**Gio.Settings.** The extension has no settings schema of its own. `keys.js` opens GNOME's own
+keybinding schemas read-only (`org.gnome.desktop.wm.keybindings`, media keys, IBus…). It does this
+only to warn when a chosen shortcut is already taken, because GNOME silently keeps such keys.
+
+**shell-version.** Only `51`, the stable release this was tested on.
 
 **Logging.** Only warnings and errors are logged. Per-dictation notes use `console.debug` and never
 contain the text.
