@@ -1,3 +1,5 @@
+<p align="center"><img src="data/dictator.svg" width="128" height="128" alt=""></p>
+
 # Dictator: offline voice dictation for GNOME
 
 Press **Ctrl+Alt+Space**, speak, then press **Enter**. The text is typed where your cursor was: a
