@@ -596,6 +596,9 @@ export class Core {
     _rememberTarget() {
         const win = global.display.focus_window;
         const target = this._target = win ? {win, kittyId: null, kittySock: null} : null;
+        const app = win ? Shell.WindowTracker.get_default().get_window_app(win) : null;
+        this._appIcon.gicon = app?.get_icon() ?? null;
+        this._appIcon.accessible_name = app?.get_name() ?? '';
         if (!win || !KITTEN || !KITTY_RE.test(win.get_wm_class() ?? ''))
             return;
         const sock = GLib.build_filenamev([GLib.get_user_runtime_dir(), `kitty-${win.get_pid()}`]);
@@ -1054,7 +1057,9 @@ export class Core {
         this._wave.connect('repaint', a => this._drawWave(a));
         this._time = new St.Label({style_class: 'dictation-time', text: '0:00', y_align});
         this._status = new St.Label({style_class: 'dictation-status', y_align});
-        for (const w of [this._badge, this._spinner, this._wave, this._time, this._status])
+        // where the text will go: the icon of the app that had the focus when the recording started
+        this._appIcon = new St.Icon({style_class: 'dictation-app-icon', icon_size: 20, visible: false, y_align});
+        for (const w of [this._badge, this._spinner, this._wave, this._time, this._status, this._appIcon])
             this._pill.add_child(w);
         // plain child of the UI group: drawn on top of the windows
         Main.layoutManager.uiGroup.add_child(this._pill);
@@ -1217,6 +1222,7 @@ export class Core {
         this._wave.show();
         this._time.show();
         this._status.hide();
+        this._appIcon.visible = !!this._appIcon.gicon;
         if (newMonitor)
             this._time.text = '0:00';
         this._present();
@@ -1245,6 +1251,7 @@ export class Core {
         this._setBadge('pause');
         this._wave.hide();
         this._time.show();
+        this._appIcon.visible = !!this._appIcon.gicon;
         this._status.text = 'Paused';
         this._status.show();
         this._present();
@@ -1266,6 +1273,8 @@ export class Core {
         this._setBadge(kind);
         this._wave.hide();
         this._time.visible = kind === 'busy';
+        // the app icon only while this recording's text is on its way (not for Retry, not when done)
+        this._appIcon.visible = kind === 'busy' && this._state === 'busy' && !!this._appIcon.gicon;
         this._status.text = msg;
         this._status.show();
         this._present();

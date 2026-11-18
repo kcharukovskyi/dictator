@@ -42,6 +42,7 @@
 }
 
 .dictation-status { padding-right: 4px; }
+.dictation-app-icon { margin-left: 2px; }
 
 /* Top-bar menu: the last texts, one line each, with the time dimmed on the right */
 .dictation-menu-text { max-width: 22em; }
