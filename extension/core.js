@@ -10,6 +10,7 @@
 // typed text gets a Ctrl+V paste through the clipboard only if the user allowed it in Settings;
 // otherwise the text waits in the top-bar menu.
 // While recording, Caps Lock pauses (by default): the lock itself is put back as it was.
+// The pill can be dragged with the mouse; it stays where you put it (double-click: back to its place).
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import Graphene from 'gi://Graphene';
@@ -22,7 +23,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as Keyboard from 'resource:///org/gnome/shell/ui/status/keyboard.js';
-import {readKeys, readPrivacy, readSpeech, cleanText, CAPS, NONE, SAME, NEWLINE_MARK} from './keys.js';
+import {readKeys, readPrivacy, readSpeech, readPillSpot, writePillSpot, cleanText, CAPS, NONE, SAME, SHIFT_CAPS,
+    NEWLINE_MARK} from './keys.js';
 
 const HELPER = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'dictate']);
 const PENDING_DIR = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'dictate']);
@@ -45,7 +47,7 @@ const CHAT_RE = /telegram|signal|discord|slack|element|whatsapp|messenger|teams|
 // keyboard layouts without Latin letters (xkb names): for the paste keys a Latin one is switched on
 const NON_LATIN_RE = /^(ua|ru|by|bg|mk|rs|gr|il|ara|ir|af|iq|sy|th|kz|kg|mn|ge|am|tj|bd|lk|np|la|kh|mm|et)$/;
 const LAYOUT_SETTLE_MS = 120;
-const CHORD_US = 600000;        // a Caps press this close to the shortcut is not a pause
+const CHORD_US = 600000;        // a Caps press this close to the shortcut is not a pause (nor a finish)
 const RESTORE_MS = 700;         // put Caps Lock back this long after the last Caps press
 const SELF_US = 300000;         // a Caps change this soon after our own Caps tap is ours
 const KITTEN = GLib.find_program_in_path('kitten');
@@ -86,7 +88,7 @@ export class Core {
         // [time, state after, made by us]
         this._capsLog = [[GLib.get_monotonic_time(), this._keymap.get_caps_lock_state(), true]];
         this._selfUntil = 0;
-        this._lastChord = 0;
+        this._lastChord = this._startedAt = 0;
         this._capsBefore = null;            // Caps Lock state to put back, while a restore is pending
         this._restoreId = 0;
         this._paused = false;
@@ -125,6 +127,8 @@ export class Core {
         for (const id of this._acts ?? [])
             GLib.source_remove(id);
         this._acts?.clear();
+        this._hideAfterDrag = false;
+        this._dragEnd();
         this._pill?.destroy();
         this._pill = null;
         this._indicator?.destroy();
@@ -151,8 +155,10 @@ export class Core {
                     const self = t < this._selfUntil;
                     this._capsLog.push([t, on, self]);
                     this._capsLog.splice(0, this._capsLog.length - 32);
-                    if (!self)
-                        this._onCaps(on, t);
+                    if (!self) {
+                        const [,, mods] = global.get_pointer();
+                        this._onCaps(on, t, !!(mods & Clutter.ModifierType.SHIFT_MASK));
+                    }
                 }
             });
         }
@@ -253,14 +259,19 @@ export class Core {
         }
     }
 
-    // a Caps Lock change made by you (not by us)
-    _onCaps(on, t) {
+    // a Caps Lock change made by you (not by us); shift: Shift was held
+    _onCaps(on, t, shift) {
+        const rec = this._state === 'rec';
+        // Shift+Caps Lock as the finish key; not the Caps press of a chord that just started recording
+        const finishes = rec && shift && this._keys?.finish === SHIFT_CAPS && t - this._startedAt >= CHORD_US;
         const nearChord = t - this._lastChord < CHORD_US;
-        const capsPauses = this._state === 'rec' && this._pauseKey === CAPS;
-        if (!capsPauses && this._capsBefore === null && !nearChord)
+        const capsPauses = rec && this._pauseKey === CAPS && !(shift && this._keys?.finish === SHIFT_CAPS);
+        if (!finishes && !capsPauses && this._capsBefore === null && !nearChord)
             return;                             // a normal Caps Lock press
         this._absorbCaps(!on);
-        if (capsPauses && !nearChord)
+        if (finishes)
+            this._stop();
+        else if (capsPauses && !nearChord)
             this._togglePause();
     }
 
@@ -271,7 +282,7 @@ export class Core {
         this._keys = keys;
         this._pauseKey = keys.pause;
         this._finishActions = [];
-        if (keys.finish !== SAME) {
+        if (keys.finish !== SAME && keys.finish !== SHIFT_CAPS) {   // those two are not grabbed
             const accels = keys.finish === 'Return' ? ['Return', 'KP_Enter'] : [keys.finish];
             this._finishActions = accels.map(a => this._grab(a, () => this._stop())).filter(Boolean);
             if (!this._finishActions.length)    // could not grab it: the start shortcut finishes instead
@@ -338,6 +349,8 @@ export class Core {
             this._disconnectKeyboard();
             this._indicator?.menu.close();
             this._indicator?.container.hide();
+            this._hideAfterDrag = false;
+            this._dragEnd();
             this._clearTimers();
             this._pill.remove_all_transitions();
             this._pill.hide();
@@ -456,7 +469,7 @@ export class Core {
         this._state = 'rec';
         this._rememberTarget();
         this._grabRecKeys();
-        this._t0 = GLib.get_monotonic_time();
+        this._t0 = this._startedAt = GLib.get_monotonic_time();
         this._resetWave();
         this._stdin = this._proc.get_stdin_pipe();
         this._reader = new Gio.DataInputStream({base_stream: this._proc.get_stdout_pipe()});
@@ -954,8 +967,12 @@ export class Core {
         const y_align = Clutter.ActorAlign.CENTER;
         // bms-popup-blur-target: opt in to Blur my Shell's popup blur (menus, OSDs), so with that extension the pill
         // is glass like the rest of the Shell; it keeps the pill's own capsule radius. Without it the class does nothing.
-        this._pill = new St.BoxLayout({style_class: 'dictation-pill bms-popup-blur-target', reactive: false,
+        this._pill = new St.BoxLayout({style_class: 'dictation-pill bms-popup-blur-target', reactive: true,
             visible: false, y_align});
+        this._pill.set_cursor_type(Clutter.CursorType.GRAB);
+        this._pill.connect('button-press-event', (a, e) => this._dragStart(e));
+        this._pill.connect('motion-event', (a, e) => this._dragMove(e));
+        this._pill.connect('button-release-event', () => this._dragEnd());
         this._badgeIcon = new St.Icon({style_class: 'dictation-badge-icon', icon_name: 'audio-input-microphone-symbolic',
             x_align: Clutter.ActorAlign.CENTER, y_align: Clutter.ActorAlign.CENTER});
         this._badge = new St.Bin({style_class: 'dictation-badge', child: this._badgeIcon, y_align});
@@ -968,8 +985,85 @@ export class Core {
         this._status = new St.Label({style_class: 'dictation-status', y_align});
         for (const w of [this._badge, this._spinner, this._wave, this._time, this._status])
             this._pill.add_child(w);
-        // plain child of the UI group: drawn on top, never takes clicks
+        // plain child of the UI group: drawn on top of the windows
         Main.layoutManager.uiGroup.add_child(this._pill);
+    }
+
+    // ------------------------------------------------------------ dragging the pill
+    // Press and drag moves the pill; it stays there for the next recordings too (keys.js readPillSpot,
+    // a share of the monitor, so it works on any monitor). A double-click puts it back where Settings say.
+    // While the button is held the stage grab sends every motion here, also when the pointer outruns
+    // the pill. Nothing reaches the app under the pill, and the text still goes to the window where the
+    // recording started.
+    _dragStart(event) {
+        if (event.get_button() !== Clutter.BUTTON_PRIMARY)
+            return Clutter.EVENT_PROPAGATE;
+        if (this._drag)
+            return Clutter.EVENT_STOP;
+        const [px, py] = event.get_coords();
+        const {double_click_time: ms, double_click_distance: far} = Clutter.Settings.get_default();
+        const last = this._lastPress;
+        this._lastPress = {time: event.get_time(), x: px, y: py};
+        if (last && event.get_time() - last.time <= ms && Math.hypot(px - last.x, py - last.y) <= far) {
+            this._lastPress = null;     // a double-click: back to the place chosen in Settings
+            writePillSpot(null);
+            this._place();
+            return Clutter.EVENT_STOP;
+        }
+        this._pill.remove_transition('translation-y');
+        this._pill.translation_y = 0;
+        this._drag = {dx: px - this._pill.x, dy: py - this._pill.y, moved: false,
+            grab: global.stage.grab(this._pill)};
+        this._pill.set_cursor_type(Clutter.CursorType.GRABBING);
+        return Clutter.EVENT_STOP;
+    }
+
+    _dragMove(event) {
+        if (!this._drag)
+            return Clutter.EVENT_PROPAGATE;
+        const [px, py] = event.get_coords();
+        const m = this._monitorAt(px, py);
+        const [x, y] = this._clamp(m, px - this._drag.dx, py - this._drag.dy, ...this._pill.get_size());
+        this._pill.set_position(x, y);
+        this._monitor = m;
+        this._drag.moved = true;
+        return Clutter.EVENT_STOP;
+    }
+
+    _dragEnd() {
+        const drag = this._drag;
+        if (!drag)
+            return Clutter.EVENT_PROPAGATE;
+        this._drag = null;
+        drag.grab.dismiss();
+        this._pill?.set_cursor_type(Clutter.CursorType.GRAB);
+        const m = this._monitor;
+        if (drag.moved && m) {
+            const [w, h] = this._pill.get_size();
+            try {
+                writePillSpot({x: Math.min(1, Math.max(0, (this._pill.x + w / 2 - m.x) / m.width)),
+                    y: Math.min(1, Math.max(0, (this._pill.y + h / 2 - m.y) / m.height))});
+            } catch (e) {
+                console.warn(`dictator: cannot save the pill position: ${e.message}`);
+            }
+        }
+        if (this._hideAfterDrag) {
+            this._hideAfterDrag = false;
+            this._hide();
+        }
+        return Clutter.EVENT_STOP;
+    }
+
+    _monitorAt(x, y) {
+        const lm = Main.layoutManager;
+        return lm.monitors.find(m => x >= m.x && x < m.x + m.width && y >= m.y && y < m.y + m.height) ??
+            this._monitor ?? lm.primaryMonitor;
+    }
+
+    // the pill's top-left corner at (x, y), moved so that the whole w x h pill is on monitor m
+    _clamp(m, x, y, w, h) {
+        return [Math.round(Math.min(Math.max(x, m.x), m.x + m.width - w)),
+            Math.round(Math.min(Math.max(y, m.y), m.y + m.height - h))];
     }
 
     // the monitor you type on: the focused window's, else the one under the pointer
@@ -983,8 +1077,16 @@ export class Core {
         const m = Main.layoutManager.monitors.includes(this._monitor) ? this._monitor : Main.layoutManager.primaryMonitor;
         if (!m)
             return;
+        if (this._drag)                 // you are moving it
+            return;
         const [, w] = this._pill.get_preferred_width(-1);
         const [, h] = this._pill.get_preferred_height(w);
+        const spot = readPillSpot();
+        if (spot) {                     // where you dragged it
+            this._pill.set_position(...this._clamp(m, m.x + spot.x * m.width - w / 2,
+                m.y + spot.y * m.height - h / 2, w, h));
+            return;
+        }
         // Settings: at the bottom (like a toast) or at the top, under the top bar
         const top = m.y + (m === Main.layoutManager.primaryMonitor ? Main.panel.height : 0) + 16;
         const y = this._pillTop ? top : m.y + m.height - h - 48;
@@ -999,8 +1101,10 @@ export class Core {
     // fade and slide in from below like a libadwaita toast (only when it was hidden)
     _present() {
         Main.layoutManager.uiGroup.set_child_above_sibling(this._pill, null);
-        if (!this._pill.visible)
-            this._pillTop = readSpeech().pill === 'top';
+        if (!this._pill.visible) {          // slides in from the nearer screen edge
+            const spot = readPillSpot();
+            this._pillTop = spot ? spot.y < 0.5 : readSpeech().pill === 'top';
+        }
         this._place();
         if (this._pill.visible && this._pill.opacity === 255 && !this._hiding)
             return;
@@ -1103,6 +1207,10 @@ export class Core {
     }
 
     _hide() {
+        if (this._drag) {               // not out from under the pointer: once you let go
+            this._hideAfterDrag = true;
+            return;
+        }
         this._clearTimers();
         this._hiding = true;
         this._pill.ease({opacity: 0, translation_y: this._slide, duration: 200, mode: Clutter.AnimationMode.EASE_IN_QUAD,

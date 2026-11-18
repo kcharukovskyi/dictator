@@ -7,6 +7,7 @@
 //   privacy       history = on|off, keep_minutes = N, clipboard = on|off
 //   speech        languages, text options, microphone, model... (see writeSpeech)
 //   replacements  "what you say = what is typed", one per line
+//   pill          where you dragged the recording indicator (see readPillSpot)
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
@@ -15,13 +16,15 @@ export const KEYS_FILE = GLib.build_filenamev([DIR, 'keys']);
 export const CAPS = 'CapsLock';
 export const NONE = 'none';
 export const SAME = 'start';            // finish = the start shortcut again
+export const SHIFT_CAPS = 'Shift+CapsLock';  // finish = Caps Lock pressed while Shift is held
 export const DEFAULTS = Object.freeze({start: '<Control><Alt>space', finish: 'Return', pause: CAPS, cancel: 'Escape'});
 
 const HEADER = `# Dictator keys. Easiest to change in the settings window: top-bar microphone menu ->
 # "Settings", or: gnome-extensions prefs dictator@kcharukovskyi.github.io
 # By hand: name = GNOME accelerator, e.g. <Control><Alt>space  <Super>d  <Control><Shift>d  F9  Pause
 #   start   start a recording (repeat the line for more shortcuts)
-#   finish  while recording: finish and paste (Return = Enter); start = the start shortcut again
+#   finish  while recording: finish and paste (Return = Enter); start = the start shortcut again;
+#           Shift+CapsLock = Caps Lock pressed while Shift is held (the lock is not toggled)
 #   pause   pause / resume while recording; CapsLock = Caps Lock (the lock is not toggled); none = off
 #   cancel  cancel while recording; none = off
 # Applies at once, no log out. A shortcut that GNOME or another app already uses does not work.
@@ -224,6 +227,27 @@ export function writeSpeech(p) {
         `model = ${p.model}\n`);
 }
 
+// Where you dragged the recording indicator: its centre as a share of the monitor's width and height
+// (0..1), so it lands in the same spot on any monitor. null: the place chosen in Settings.
+export const PILL_FILE = GLib.build_filenamev([DIR, 'pill']);
+
+export function readPillSpot() {
+    const m = (load(PILL_FILE) ?? '').match(/^\s*x\s*=\s*([\d.]+)\s*\n\s*y\s*=\s*([\d.]+)\s*$/m);
+    const [x, y] = m ? [parseFloat(m[1]), parseFloat(m[2])] : [NaN, NaN];
+    return x >= 0 && x <= 1 && y >= 0 && y <= 1 ? {x, y} : null;
+}
+
+// spot: {x, y} as above, or null to go back to the place chosen in Settings
+export function writePillSpot(spot) {
+    if (!spot) {
+        GLib.unlink(PILL_FILE);
+        return;
+    }
+    GLib.mkdir_with_parents(DIR, 0o700);
+    GLib.file_set_contents(PILL_FILE, '# Dictator: where you dragged the recording indicator (share of the screen)\n' +
+        `x = ${spot.x.toFixed(4)}\ny = ${spot.y.toFixed(4)}\n`);
+}
+
 // the replacements file, created with an explanation the first time
 export function ensureReplacements() {
     if (GLib.file_test(REPLACE_FILE, GLib.FileTest.EXISTS))
@@ -251,6 +275,8 @@ export function cleanText(t) {
 export function prettyAccel(a) {
     if (a === CAPS)
         return 'Caps Lock';
+    if (a === SHIFT_CAPS)
+        return 'Shift+Caps Lock';
     if (a === NONE)
         return 'off';
     const mods = {control: 'Ctrl', primary: 'Ctrl', ctrl: 'Ctrl', alt: 'Alt', super: 'Super', shift: 'Shift',
