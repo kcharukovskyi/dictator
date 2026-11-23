@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A long text no longer closes the app it is typed into. The input method hands an app the whole
+  text as one Wayland message, and an app drops its connection on a message over 4096 bytes (about
+  2000 Cyrillic letters or 4000 Latin ones): kitty and GTK windows closed at once after a
+  dictation of several minutes. The text is now typed in parts of at most 2000 bytes, cut after a
+  space, one after another; if you switch windows meanwhile, the rest is typed nowhere and the whole
+  text waits in the microphone menu.
 - Settings → Speech → Speech Model → **Try Dictation**: record a sentence and see the text right
   there, typed nowhere and kept nowhere (`dictate --try`). Without the helper, the settings window
   shows the install command, ready to select and copy.
