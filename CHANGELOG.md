@@ -8,6 +8,24 @@
   dictation of several minutes. The text is now typed in parts of at most 2000 bytes, cut after a
   space, one after another; if you switch windows meanwhile, the rest is typed nowhere and the whole
   text waits in the microphone menu.
+- **Small model**, the new default: [tinyasr](https://github.com/dkaraush/tinyasr) by Danil Karaush,
+  with our speed-up (`engine/`). 9 languages in 5 packs of about 32 MB each (English with Russian and
+  Ukrainian; with Spanish, Italian and Portuguese; with Russian and Uzbek; with Persian; with Khmer),
+  about 0.3 GB of memory. On a laptop with an Intel Ice Lake CPU (AVX-512 VNNI) it transcribes 7 to 9
+  times faster than Large, with about the same share of wrong words in Ukrainian and Russian (FLEURS:
+  6.6% and 7.3% against 7.2% and 6.6%). On an AMD Zen 2 server (AVX2) it is 18 to 35 times faster
+  than the original tinyasr. Packs come from tinyasr's GitHub at a fixed commit, each
+  checked against its SHA-256 (`dictate --download small`). The Large model (NVIDIA Parakeet, 25
+  languages) stays, unchanged.
+- `install.sh` asks for Small or Large and for your languages (suggested: your system's language and
+  English; `--yes` takes the suggestions). For Small it builds the program `dictate-tinyasr` on your
+  computer: with Rust if you have it, else in a podman or docker image of Fedora's Rust
+  (`engine/Containerfile`), with no network during the build. The binary is static and runs on any
+  CPU of its kind; the engine picks the CPU code when it starts.
+- `uninstall.sh` removes the Small model's program; with `--all`, its packs and the build image too.
+- GitHub Actions also builds and tests the engine and the worker, and checks that the worker is
+  static.
+
 - Settings → Speech → Speech Model → **Try Dictation**: record a sentence and see the text right
   there, typed nowhere and kept nowhere (`dictate --try`). Without the helper, the settings window
   shows the install command, ready to select and copy.
