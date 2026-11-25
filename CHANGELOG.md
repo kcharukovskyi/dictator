@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A long text no longer closes the app it is typed into. The input method hands an app the whole
+  text as one Wayland message, and an app drops its connection on a message over 4096 bytes (about
+  2000 Cyrillic letters or 4000 Latin ones): kitty and GTK windows closed at once after a
+  dictation of several minutes. The text is now typed in parts of at most 2000 bytes, cut after a
+  space, one after another; if you switch windows meanwhile, the rest is typed nowhere and the whole
+  text waits in the microphone menu.
 - **Small model**, the new default: [tinyasr](https://github.com/dkaraush/tinyasr) by Danil Karaush,
   with our speed-up (`engine/`). 9 languages in 5 packs of about 32 MB each (English with Russian and
   Ukrainian; with Spanish, Italian and Portuguese; with Russian and Uzbek; with Persian; with Khmer),

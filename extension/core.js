@@ -65,9 +65,48 @@ const OSD_QUIET_AFTER_US = 10 * 1000000;
 const CLIPBOARD_RESTORE_MS = 1500;
 const CLIPBOARD_READ_MS = 500;
 const IM_SETTLE_MS = 150;     // let a re-focused text field reach the input method first
+// One input-method commit reaches a Wayland app as one protocol message, and the app's Wayland library
+// closes its whole connection on a message over 4096 bytes: the window vanishes (seen with kitty and GTK)
+// (kitty: "Message length 14284 exceeds limit 4096", about 8000 Cyrillic characters). So a long text
+// is typed in parts of at most IM_PART_BYTES of UTF-8, cut after a space. Each part is committed only
+// after the Shell has sent the app the "done" of the one before (it does that in an idle at
+// PRIORITY_DEFAULT + 1, our next part waits for a PRIORITY_LOW idle): the protocol keeps just the last
+// text before a "done", so two parts sent together would lose the first.
+const IM_PART_BYTES = 2000;
+const IM_PART_MS = 20;
 const HISTORY_N = 3;          // texts in the top-bar menu
 const TEXT_MIMES = ['text/plain;charset=utf-8', 'UTF8_STRING', 'text/plain', 'STRING', 'TEXT'];
 const SECRET_MIME = 'x-kde-passwordManagerHint';
+
+// the text in parts of at most IM_PART_BYTES bytes of UTF-8 for the input method (see there): cut
+// after the last space or line break of a part, else between two characters (never inside one, nor
+// before an accent that belongs to the letter in front of it)
+function imParts(text, max = IM_PART_BYTES) {
+    const parts = [];
+    let start = 0, bytes = 0, space = -1;
+    for (let i = 0; i < text.length;) {
+        const cp = text.codePointAt(i);
+        const len = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+        const next = i + (cp > 0xffff ? 2 : 1);
+        if (bytes + len > max && i > start) {
+            let cut = space > start ? space : i;
+            while (cut > start + 1 && /\p{M}/u.test(text[cut]))
+                cut--;
+            if (cut > start + 1 && /[\uDC00-\uDFFF]/.test(text[cut]))
+                cut--;          // not between the two halves of an emoji or other astral character
+            parts.push(text.slice(start, cut));
+            start = cut;
+            bytes = new TextEncoder().encode(text.slice(start, i)).length;
+            space = -1;
+        }
+        bytes += len;
+        if (/\s/.test(text[i]))
+            space = next;
+        i = next;
+    }
+    parts.push(text.slice(start));
+    return parts;
+}
 
 export class Core {
     // opts.openPrefs: opens the settings window; given by extension.js
@@ -729,9 +768,7 @@ export class Core {
             const app = win ? `${win.get_wm_class() ?? ''} ${win.get_gtk_application_id?.() ?? ''}`.trim() : 'no window';
             const typed = this._forApp(text, app);
             if (Main.inputMethod?.currentFocus) {
-                Main.inputMethod.commit(typed);
-                this._note(`typed in through the input method into "${app}"`);
-                this._show('done', 'Inserted', 1500);
+                this._commit(imParts(typed), text, app, win, Main.inputMethod.currentFocus);
             } else if (readPrivacy().clipboard) {
                 this._note(`"${app}" takes no typed text: pasting through the clipboard (allowed in Settings)`);
                 this._saveClipboard(saved => {
@@ -746,6 +783,25 @@ export class Core {
                 this._missed(text, 'This app does not take typed text');
             }
         });
+    }
+
+    // type the parts in one by one, while the same window and text field have the keyboard; if that
+    // changes (or the screen locks) the rest is not typed anywhere else and the text waits in the menu
+    _commit(parts, text, app, win, focus) {
+        Main.inputMethod.commit(parts[0]);
+        if (parts.length === 1) {
+            this._note(`typed in through the input method into "${app}"`);
+            this._show('done', 'Inserted', 1500);
+            return;
+        }
+        this._act(IM_PART_MS, () => this._idle(() => {
+            if (this._locked)
+                this._keep(text);
+            else if (global.display.focus_window !== win || Main.inputMethod?.currentFocus !== focus)
+                this._missed(text, 'Typing was interrupted');
+            else
+                this._commit(parts.slice(1), text, app, win, focus);
+        }));
     }
 
     _paste(settle = 0, restore = null) {
@@ -1413,6 +1469,18 @@ export class Core {
     _act(ms, fn) {
         this._acts ??= new Set();
         const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+            this._acts.delete(id);
+            fn();
+            return GLib.SOURCE_REMOVE;
+        });
+        this._acts.add(id);
+        return id;
+    }
+
+    // an action after everything of higher priority, the Shell's own idles included
+    _idle(fn) {
+        this._acts ??= new Set();
+        const id = GLib.idle_add(GLib.PRIORITY_LOW, () => {
             this._acts.delete(id);
             fn();
             return GLib.SOURCE_REMOVE;
